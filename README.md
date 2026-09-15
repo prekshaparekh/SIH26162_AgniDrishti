@@ -22,6 +22,7 @@
 
 ## Table of contents
 
+
 - [The problem](#the-problem)
 - [What AgniDrishti does](#what-agnidrishti-does)
 - [Why the naive approaches fail](#why-the-naive-approaches-fail)
