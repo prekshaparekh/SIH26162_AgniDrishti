@@ -1,0 +1,617 @@
+# AgniDrishti
+
+**AI-assisted geospatial detection and classification of industrial fires and persistent thermal anomalies.**
+
+![Status](https://img.shields.io/badge/status-prototype-orange)
+![Python](https://img.shields.io/badge/python-3.11+-blue)
+![Django](https://img.shields.io/badge/django-5.x-092E20)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+> Satellites already tell us *where* the Earth is hot. They do not tell us *why*.
+> AgniDrishti is the layer that answers the second question.
+
+| | |
+|---|---|
+| **Problem Statement ID** | 26162 |
+| **Title** | AI-Based Detection and Classification of Industrial Fires and Persistent Thermal Sources Using NASA FIRMS, OSM & Satellite Data |
+| **Organisation** | National Technical Research Organisation (NTRO) |
+| **Theme** | Disaster Management |
+| **Team** | AsyncMavericks_SIH0162 |
+
+---
+
+## Table of contents
+
+- [The problem](#the-problem)
+- [What AgniDrishti does](#what-agnidrishti-does)
+- [Why the naive approaches fail](#why-the-naive-approaches-fail)
+- [Study region and validation scope](#study-region-and-validation-scope)
+- [How it works](#how-it-works)
+- [Classification logic (v1)](#classification-logic-v1)
+- [What the system outputs](#what-the-system-outputs)
+- [Feature set](#feature-set)
+- [Data sources](#data-sources)
+- [Map layers](#map-layers)
+- [Technology stack](#technology-stack)
+- [Implementation status](#implementation-status)
+- [Architecture](#architecture)
+- [Getting started](#getting-started)
+- [Project structure](#project-structure)
+- [Roadmap](#roadmap)
+- [Security](#security)
+- [Known limitations](#known-limitations)
+- [Team](#team)
+- [Data attribution and licensing](#data-attribution-and-licensing)
+
+---
+
+## The problem
+
+NASA's FIRMS service publishes near-real-time **thermal anomalies** detected by the MODIS and VIIRS
+instruments. Every few hours, a fresh set of hot pixels appears over India.
+
+A thermal anomaly is not a fire alert. The same signal is produced by:
+
+- an actual industrial accident inside a chemical plant,
+- a refinery gas flare that has burned continuously for fifteen years,
+- post-harvest crop residue burning in the field next door,
+- a smouldering municipal landfill,
+- a brick kiln, a steel furnace, or a sun-heated metal roof.
+
+For an authority monitoring an industrial corridor, this is close to unusable. The persistent
+sources fire the same alert every single day, and genuine incidents are buried inside that noise.
+The information gap is not detection — **it is interpretation.**
+
+## What AgniDrishti does
+
+AgniDrishti ingests thermal anomalies, enriches each one with geospatial context, and assigns it to
+one of four classes, together with the evidence behind that decision:
+
+| Class | Meaning | Typical signature |
+|---|---|---|
+| 🔴 **Industrial fire** | A probable unplanned fire event on industrial land | High FRP, industrial land cover, **low** historical recurrence |
+| 🟠 **Persistent thermal source** | Routine, continuous industrial heat — flares, furnaces, kilns | Stable FRP, industrial land cover, **high** recurrence at the same location |
+| 🟢 **Vegetation fire** | Crop residue, forest, grassland or scrub burning | Vegetated/cropland land cover, away from industrial infrastructure |
+| ⚪ **Other / uncertain** | Signal present, context insufficient or contradictory | Low confidence, conflicting features, landfill/unmapped sites |
+
+Outputs are delivered through an interactive map with filtering, per-hotspot evidence panels, and
+time-series analytics.
+
+**The core design principle:** every classification is shown together with the features that produced
+it. A user never sees a bare label. They see *"Persistent thermal source — detected on 84 of the last
+90 days, 210 m from a mapped refinery, on built-up land cover, FRP stable at 38 ± 6 MW."*
+
+## Why the naive approaches fail
+
+This section exists because the obvious solutions are the wrong ones, and knowing why shaped the
+entire design.
+
+**1. "Just show the FIRMS hotspots on a map."**
+Large refinery complexes produce detections almost every day. So does every flare stack in the
+corridor. An operator receiving those alerts stops reading alerts within a week. Raw display without
+classification actively destroys the value of the data.
+
+**2. "Label a hotspot as industrial if it is near a factory."**
+This is circular. If proximity to industry decides the label, and proximity to industry is also the
+model's input, the model has learned nothing — it has memorised a rule we wrote ourselves, and its
+reported accuracy is meaningless. It also produces confident, wrong answers in exactly the cases
+that matter: a crop fire 600 m from a GIDC estate boundary, or a landfill fire adjacent to an
+industrial zone.
+
+> **In AgniDrishti, distance to industrial infrastructure is a feature. It is never a label.**
+> Labels come from contextual verification using satellite imagery and map evidence.
+
+**3. "Classify each detection on its own."**
+An industrial fire and a routine gas flare look nearly identical in a single snapshot — both are hot,
+both sit on built-up land, both are near a factory. The signal that separates them is **temporal**:
+a flare recurs at the same coordinates for months with stable radiative power; a fire is an anomaly
+against that baseline. AgniDrishti therefore models each location's history, not just each detection.
+
+## Study region and validation scope
+
+We deliberately separate **where the system runs** from **where it has been verified**. Conflating
+the two is how projects end up claiming coverage they cannot defend.
+
+### Ingestion scope — the state of Gujarat
+
+```
+INGEST_BBOX = 68.9, 20.0, 73.5, 23.6      # lon_min, lat_min, lon_max, lat_max
+```
+
+The pipeline ingests and classifies thermal anomalies across the whole state. Enrichment runs once
+at ingest time and is stored on each record, so region size does not affect query performance.
+
+### Validation corridor — Hazira to Ankleshwar
+
+```
+VALIDATION_BBOX = 72.4, 21.0, 73.2, 22.0   # approx. 83 km x 111 km
+```
+
+Our labelled dataset, our annotation queue and our reported accuracy metrics are concentrated in
+this corridor — Hazira, Surat, Dahej, Bharuch and Ankleshwar. It was chosen because it contains all
+four target classes within a single map view:
+
+- **Persistent thermal sources** — petrochemical flaring at Hazira and Dahej.
+- **Industrial fire risk** — the chemical estates of the "Golden Corridor": Ankleshwar, Vapi, Vatva.
+- **Vegetation fires** — the surrounding cropland and scrub.
+- **Other / confounders** — municipal landfill sites and brick kilns, the classic source of false
+  industrial-fire alarms.
+
+Concentrating a limited labelling budget produces dense, defensible ground truth. Spreading the same
+number of labels across the whole state would give a handful of examples per industrial cluster and
+confidence in none of them. **With a small sample, depth beats breadth.**
+
+The bounding boxes are configuration values. Widening either one is a config change, not a redesign.
+
+## How it works
+
+```mermaid
+flowchart TD
+    A["NASA FIRMS<br/>VIIRS thermal anomalies"] --> B[Ingest and deduplicate]
+    B --> C[Spatial clustering<br/>group detections into persistent sites]
+    C --> D{Context enrichment}
+
+    E["OpenStreetMap<br/>industrial infrastructure"] --> D
+    F["ESA WorldCover<br/>10 m land cover"] --> D
+    G["Detection history<br/>recurrence and FRP stability"] --> D
+
+    D --> H[Feature vector per site]
+    H --> I["Classifier<br/>v1: transparent rules<br/>v2: Random Forest"]
+    I --> J[Class + confidence + evidence]
+    J --> K["Leaflet map<br/>layers, filters, evidence panel"]
+    J --> L["Plotly analytics<br/>trends and distributions"]
+```
+
+**Step by step:**
+
+1. **Ingest** — pull FIRMS VIIRS detections for the ingestion bounding box, near-real-time plus a
+   rolling 90-day archive.
+2. **Cluster** — group detections falling within a small radius into a single persistent *site*, so
+   that history accumulates per location rather than per pixel.
+3. **Enrich** — for each site, compute distance to the nearest mapped industrial feature (OSM), read
+   the land cover class beneath it (ESA WorldCover), and derive temporal statistics from its history.
+4. **Classify** — apply the rule set below, producing a class, a confidence score, and the list of
+   features that drove it.
+5. **Visualise** — render on an interactive map with supporting charts.
+
+## Classification logic (v1)
+
+**Version 1 uses a documented, transparent rule set, not a machine learning model.** This is a
+deliberate choice, and we state it openly rather than describing an untrained model as if it were
+working.
+
+The rules encode our domain hypothesis *explicitly*. Their purpose is threefold: to make the
+prototype demonstrable end-to-end, to expose the hypothesis to criticism, and to pre-label candidates
+in the annotation interface so that human reviewers **correct** rather than label from scratch —
+which is how we intend to reach a usable training set efficiently.
+
+| Priority | Rule | Assigned class |
+|---|---|---|
+| 1 | VIIRS confidence is `low` | Other / uncertain |
+| 2 | Recurrence ≥ persistent threshold **and** ≤ 1 km from industrial feature **and** land cover ∈ {Built-up, Bare} **and** FRP coefficient of variation < 0.5 | Persistent thermal source |
+| 3 | ≤ 1 km from industrial feature **and** land cover ∈ {Built-up, Bare} **and** FRP ≥ 10 MW **and** (recurrence ≤ episodic threshold **or** FRP coefficient of variation ≥ 0.5) | Industrial fire |
+| 4 | Land cover ∈ {Tree cover, Shrubland, Grassland, Cropland} | Vegetation fire |
+| 5 | None of the above | Other / uncertain |
+
+**Recurrence thresholds are relative to the observation window.** "Detected on 20 days" means
+something entirely different over a 90-day archive than over a 7-day feed, so the thresholds are
+held as fractions of the window (20/90 and 3/90) with floors that stop a short window producing
+statistically meaningless rules. Over 90 days they reproduce the documented 20 and 3 days exactly.
+
+**Two design decisions in these rules are worth stating explicitly**, because the obvious
+alternatives are wrong:
+
+*Rule 3 tests instability, not just rarity.* Anything reaching it has already failed Rule 2, so it is
+not a stable recurrent source. It qualifies as a fire if it is either rare **or** erratic in
+radiative power. Testing rarity alone mislabels multi-day fires as uncertain — a fire that burns for
+three days is still a fire. A flare is steady; a fire flares up and dies down.
+
+*Rule 4 lets land cover lead.* An earlier version also required the site to be more than a kilometre
+from mapped industry, which denied the vegetation label to 18 of 106 sites burning on cropland merely
+because a factory stood nearby. A hot pixel on cropland is cropland burning, whatever sits next door.
+Proximity now lowers confidence and is recorded in the evidence instead of silently overriding the
+land cover.
+
+These thresholds are **initial estimates, not validated science.** No accuracy figure is claimed for
+them, because no labelled test set exists yet. Their role is to be replaced: in v2, a Random Forest
+learns these boundaries from labelled data instead of having them hard-coded by us.
+
+The classifier sits behind a single interface, so swapping the implementation does not touch the
+rest of the system:
+
+```python
+class Classifier(Protocol):
+    def predict(self, features: SiteFeatures) -> Classification: ...
+```
+
+## What the system outputs
+
+Each classified site produces one record, surfaced in the map's evidence panel:
+
+```
+Site #1847 · 21.6412° N, 72.9903° E
+Class:        Persistent thermal source   (confidence: high)
+Evidence:     detected on 84 of the last 90 days
+              FRP stable at 38 ± 6 MW (CV 0.16)
+              210 m from nearest mapped industrial feature
+              nearest feature type: petroleum refinery (OpenStreetMap)
+              land cover: Built-up · 78% built-up within 500 m
+              first seen: 2023-04-11
+```
+
+**An important distinction about industry type.** The model predicts *one of four classes* and
+nothing else. The industry type shown above is **retrieved from OpenStreetMap, not predicted** — it
+is the tag on the nearest mapped feature, displayed as supporting context.
+
+AgniDrishti does not identify what kind of facility is burning. It reports what is mapped nearby.
+We are explicit about this because the difference between a prediction and a database lookup is
+exactly the kind of claim that should not be blurred.
+
+## Feature set
+
+The same feature vector feeds the v1 rules and the planned v2 model.
+
+| Feature | Source | Rationale |
+|---|---|---|
+| `frp` | FIRMS | Fire Radiative Power (MW) — energy release rate |
+| `brightness_k` | FIRMS | Brightness temperature (K), VIIRS I-4 channel |
+| `confidence` | FIRMS | Detection reliability — VIIRS reports low / nominal / high |
+| `is_night` | FIRMS | Day/night flag; industrial heat is time-invariant, most crop burning is not |
+| `recurrence_90d` | Derived | Distinct days with a detection at this site in 90 days — the key discriminator |
+| `frp_mean`, `frp_cv` | Derived | Stability of radiative power; flares are stable, fires are not |
+| `first_seen`, `last_seen` | Derived | Site age — a source active for years is not an accident |
+| `dist_industrial_m` | OSM | Distance to nearest industrial feature — **a feature, not a label** |
+| `industrial_group` | OSM | Coarse category of the nearest feature (see below) |
+| `landcover_class` | ESA WorldCover | 10 m land cover beneath the detection |
+| `landcover_frac_builtup` | ESA WorldCover | Built-up fraction within a 500 m buffer |
+
+**Industrial groups.** OpenStreetMap carries dozens of industrial tags. With a few hundred training
+examples, a high-cardinality categorical fragments into splits too thin to learn from, so tags are
+collapsed into six groups:
+
+`petro_chemical` · `power_generation` · `metals_heavy` · `light_manufacturing` · `waste_landfill` · `extraction_kiln`
+
+**Why there are no calendar features.** Seasonality is genuinely informative for vegetation fires —
+but only across multiple annual cycles. Our labelled set will be collected over a short window, so a
+`month` feature would correlate almost perfectly with our sampling period. A Random Forest would
+split on it, score well in validation by memorising *when we collected data*, and fail on anything
+new. Calendar features are deferred until the dataset spans at least one full year. Land cover and
+recurrence already carry the signal that matters.
+
+## Data sources
+
+| Source | What we use it for | Resolution / cadence | Status |
+|---|---|---|---|
+| **NASA FIRMS — VIIRS** | Thermal anomaly detections — the primary input | 375 m; NRT within ~3 h of overpass | **v1** |
+| *NASA FIRMS — MODIS* | *Additional detections via multi-sensor fusion* | *1 km* | *Planned* |
+| **OpenStreetMap** | Industrial infrastructure: `landuse=industrial`, `man_made=works`, `man_made=flare`, `power=plant`, `landuse=landfill`, `landuse=quarry` | Vector, community-maintained | **v1** |
+| **ESA WorldCover** | Land cover beneath and around each detection | 10 m, 11 classes | **v1** |
+| **Sentinel-2 MSI** | Visual verification during dataset labelling, performed manually via Copernicus Browser | 10–60 m, ~5-day revisit | **v1 (labelling workflow)** |
+| *Sentinel-2 in-app layer* | *Date-matched, cloud-free composite tiles served inside the application* | | *Planned* |
+| *Sentinel-1 SAR* | *Cloud-penetrating structural change detection* | *10–40 m* | *Planned* |
+
+**Two ways in to FIRMS.** The keyed Area API reaches a 90-day archive but needs a free
+`MAP_KEY`. NASA also publishes open regional standard products covering a rolling 7-day window with
+no key at all, and the pipeline falls back to those automatically when no key is configured. All
+three VIIRS platforms — Suomi-NPP, NOAA-20 and NOAA-21 — are pulled and merged, since they cross at
+different local times and together give materially more observations per day.
+
+**Why VIIRS only in v1.** MODIS reports confidence as a 0–100 integer while VIIRS uses
+low/nominal/high, and the two instruments have very different footprints (1 km vs 375 m), so
+supporting both means normalising two confidence schemes and deduplicating across mismatched
+pixel geometries. VIIRS alone offers finer resolution and more detections. MODIS is added later as a
+fusion step rather than as a special case threaded through the ingestion code.
+
+**Why the Sentinel-2 in-app layer is deferred.** Sentinel-2 is not published as ready-made web map
+tiles. Serving it means downloading scenes, building cloud-free composites — a raw monsoon-season
+scene over Gujarat is mostly cloud — generating and hosting tiles, and matching acquisitions to
+detection timestamps. None of that improves classification. Sentinel-2 is therefore used where it
+adds real value today: **verifying labels by eye during dataset construction.**
+
+## Map layers
+
+Leaflet is used as a **provider-agnostic rendering layer**, which means base maps are a
+configuration choice rather than an architectural commitment.
+
+| Layer | Purpose | Notes |
+|---|---|---|
+| OpenStreetMap standard | Default base map, street and industrial context | Free, no key |
+| Esri World Imagery | Satellite view — see the actual facility beneath a hotspot | Free, attribution required |
+| ISRO Bhuvan (planned) | Indian geospatial reference layers via WMS | Adds an Indian authoritative source |
+| Industrial infrastructure | OSM industrial features as an overlay | Derived from our own cached extract |
+| Classified hotspots | Colour-coded by class, with clustering at low zoom | The primary layer |
+| District choropleth | Detection counts aggregated per district | BharatViz boundary GeoJSON, styled with our own data |
+
+### Two views of the same data
+
+A point map answers *"what is burning at this location?"* It does not answer *"which districts
+warrant attention this month?"* — and for a disaster-management audience, the second question is
+often the operational one.
+
+AgniDrishti therefore offers a **district-level choropleth view** alongside the point layer. District
+and state boundaries come from [BharatViz](https://github.com/saketlab/bharatviz), an MIT-licensed
+open-source project that publishes GeoJSON boundary sets for 750+ Indian districts and 36 states. We
+load those boundaries into Leaflet as a `L.geoJSON` overlay and colour each district using our own
+aggregated detection counts:
+
+```javascript
+fetch('/static/geo/districts.geojson')
+  .then(r => r.json())
+  .then(geo => L.geoJSON(geo, {
+      style: f => ({
+        fillColor: colourScale(counts[f.properties.district] || 0),
+        weight: 1, color: '#666', fillOpacity: 0.65
+      })
+  }).addTo(map));
+```
+
+This keeps a single rendering stack — Leaflet draws both the markers and the choropleth, and the two
+layers toggle independently. Using published boundary data rather than digitising our own also means
+our district geometries match the sets used in Indian government and census reporting.
+
+BharatViz's hosted web application additionally exports publication-quality SVG and PNG choropleths
+from a CSV, which is useful for producing static figures for reports without writing plotting code.
+
+We are not adopting a single-vendor map SDK. Commercial Indian map APIs can be consumed through
+their raster tile endpoints as an additional Leaflet layer if required, but binding the application
+to a keyed, quota-limited external service would introduce a live failure mode during operation for
+no analytical gain.
+
+## Technology stack
+
+| Layer | Choice | Why this and not something else |
+|---|---|---|
+| Backend | **Django 5** | Batteries-included auth, ORM, admin and RBAC — all of which we need and none of which we want to build |
+| Interactivity | **HTMX + Alpine.js** | Server-rendered partials give us a responsive UI without a separate SPA build pipeline and API surface. A React rewrite would add complexity without adding capability at this scale |
+| Styling | **Tailwind CSS** | Rapid, consistent UI without maintaining a bespoke stylesheet |
+| Database | **SQLite** (prototype) → **PostgreSQL + PostGIS** | SQLite is sufficient for a bounded demo dataset. PostGIS becomes necessary once spatial joins and nearest-neighbour queries run over large archives — that migration is planned, not hypothetical |
+| Geospatial processing | **Shapely, Rasterio** | R-tree indexes for vector lookups; windowed reads of remote Cloud Optimized GeoTIFFs for land cover. GeoPandas is deliberately not used — it would pull in GDAL for operations these two already cover |
+| ML | **scikit-learn** (Random Forest) | Tabular features, small dataset, and — critically — inspectable feature importance. A deep network here would be less accurate *and* less explainable |
+| Maps | **Leaflet** | Lightweight and provider-agnostic: OSM, satellite imagery and Bhuvan WMS layers coexist without vendor lock-in |
+| Charts | **Plotly** | Interactive time-series and distribution analysis |
+| Boundaries | **BharatViz GeoJSON** | MIT-licensed Indian district and state boundary sets, rendered as a Leaflet choropleth layer |
+| API (planned) | **Django REST Framework** | Needed only when a second client exists; deferred until then |
+
+## Implementation status
+
+<!-- Update this table as each item lands. Do not mark anything ✅ until it demonstrably runs. -->
+
+**Legend:** ✅ Implemented · 🔨 In progress · 📋 Planned
+
+| Capability | Status | Notes |
+|---|---|---|
+| FIRMS VIIRS ingestion | ✅ | Open regional feeds (7-day) and keyed API (90-day), deduplicated |
+| Spatial clustering into persistent sites | ✅ | 0.005° grid; enables recurrence features |
+| OSM industrial layer and distance features | ✅ | 3,595 features cached for Gujarat |
+| ESA WorldCover land cover lookup | ✅ | 10 m, read remotely from Cloud Optimized GeoTIFFs |
+| Rule-based classifier (v1) | ✅ | Window-relative thresholds, documented above |
+| Interactive Leaflet map with layers and filters | ✅ | Class, FRP, recurrence, confidence |
+| Per-site evidence panel | ✅ | Shows the features behind each label |
+| Plotly analytics dashboard | ✅ | Class distribution, detections/day, recurrence spread |
+| District choropleth layer | 📋 | BharatViz boundaries + aggregated counts |
+| Historical playback over time | 📋 | |
+| Manual annotation interface | 📋 | Pre-labelled by v1 rules, corrected by reviewers |
+| Labelled training dataset (target: 300–500 verified sites) | 📋 | Corridor-scoped; quality and class balance over volume |
+| Random Forest classifier (v2) | 📋 | Replaces v1 rules behind the same interface |
+| Model evaluation on a held-out test set | 📋 | No accuracy will be claimed before this exists |
+| MODIS fusion | 📋 | Multi-sensor detection merging |
+| Sentinel-2 in-app imagery layer | 📋 | Cloud-free composites |
+| Alerting and notification rules | 📋 | |
+| PostgreSQL + PostGIS migration | 📋 | Triggered by dataset size, not by preference |
+| Authentication and role-based access | 📋 | Admin / operator / viewer |
+
+## Architecture
+
+### Current prototype
+
+```mermaid
+flowchart LR
+    subgraph Ingest["Ingestion (management commands)"]
+        A1[FIRMS VIIRS fetch] --> A2[Clustering]
+        A2 --> A3[OSM + land cover enrichment]
+    end
+    A3 --> DB[(SQLite)]
+    DB --> D["Django views<br/>+ rule classifier"]
+    D --> U["HTMX / Alpine UI<br/>Leaflet + Plotly"]
+```
+
+### Target production architecture
+
+Designed so that the AI and geospatial pipeline is **not rewritten** when the system scales — only
+its surroundings change.
+
+```mermaid
+flowchart TB
+    U["Responsive web / PWA"] --> LB[Load balancer / TLS]
+    LB --> API["Django + DRF"]
+    API --> PG[("PostgreSQL + PostGIS")]
+    API --> Q[Task queue]
+    Q --> W1["Workers:<br/>FIRMS ingestion"]
+    Q --> W2["Workers:<br/>raster and imagery processing"]
+    API --> ML["ML service<br/>classifier inference"]
+    W2 --> S3[("Object storage<br/>imagery and archives")]
+    ML --> PG
+    API --> AU["Auth + RBAC + audit log"]
+```
+
+> We are using a lightweight deployment approach for rapid prototyping and demonstration, while
+> designing the architecture so that it can later scale into a production system. **The prototype
+> itself is not production-scale, and we do not claim that it is.**
+
+## Getting started
+
+> These instructions describe the prototype. Steps for components still marked 📋 above will become
+> available as those components land.
+
+### Prerequisites
+
+- Python 3.11+
+- Optionally, a free [NASA FIRMS MAP_KEY](https://firms.modaps.eosdis.nasa.gov/api/map_key/).
+  Without one the pipeline uses NASA's open 7-day regional feeds, so it runs out of the box;
+  with one it reaches the full 90-day archive, which is what makes recurrence genuinely
+  informative.
+
+### Installation
+
+```bash
+git clone https://github.com/<your-username>/agnidrishti.git
+cd agnidrishti
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Configuration
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env`:
+
+```
+FIRMS_MAP_KEY=your_key_here
+DJANGO_SECRET_KEY=generate_a_new_one
+DEBUG=True
+INGEST_BBOX=68.9,20.0,73.5,23.6
+VALIDATION_BBOX=72.4,21.0,73.2,22.0
+```
+
+**Never commit `.env`.** It is listed in `.gitignore`.
+
+### Running
+
+```bash
+python manage.py migrate
+python manage.py load_context_layers --bbox ingest   # OSM industrial + land-use layers
+python manage.py ingest_firms --bbox ingest          # fetch, enrich and classify
+python manage.py runserver
+```
+
+Open http://127.0.0.1:8000.
+
+## Project structure
+
+```
+agnidrishti/
+├── core/                  # Django project settings, URLs
+├── hotspots/              # Detections, sites, ingestion, management commands
+│   ├── models.py
+│   ├── services/
+│   │   ├── firms.py       # FIRMS API client
+│   │   ├── clustering.py  # Detections -> persistent sites
+│   │   └── enrichment.py  # OSM distance + land cover sampling
+│   └── management/commands/
+├── classification/        # Classifier interface, v1 rules, (v2 model)
+│   ├── base.py            # Classifier protocol
+│   ├── rules.py           # v1 transparent rule set
+│   └── features.py        # Feature extraction
+├── dashboard/             # Map, filters, analytics views and templates
+├── data/                  # Cached context layers (gitignored)
+└── notebooks/             # Exploratory analysis
+```
+
+## Roadmap
+
+**Phase 1 — Working prototype (current)**
+End-to-end pipeline from FIRMS VIIRS ingestion to a classified, explorable map, using transparent
+rules.
+
+**Phase 2 — Labelled dataset**
+Annotation interface seeded with v1 predictions. Target 300–500 human-verified sites within the
+validation corridor, prioritising class balance and label quality over raw volume. Labels are
+assigned from Sentinel-2 imagery and map evidence, never automatically from proximity.
+
+**Phase 3 — Learned classifier**
+Random Forest trained on the labelled set, evaluated on a held-out test split with per-class
+precision and recall. Feature importances published. XGBoost evaluated as a comparison.
+
+**Phase 4 — Operational features**
+Alerting rules, historical playback, in-app Sentinel-2 overlay, Bhuvan layers, authentication and
+RBAC, PostgreSQL/PostGIS migration, REST API.
+
+**Phase 5 — Scale and enrichment**
+Containerised deployment, background workers, object storage, MODIS fusion, validation extended
+beyond the Hazira–Ankleshwar corridor, calendar/seasonality features once the dataset spans a full
+annual cycle, and Sentinel-1 SAR as an additional evidence layer.
+
+## Security
+
+| Area | Approach |
+|---|---|
+| Transport | HTTPS/TLS in any deployed environment |
+| Authentication | Django's authentication framework; Argon2id password hashing |
+| Authorisation | Role-based access control — admin, operator, viewer |
+| Secrets | Environment variables; never committed. `.env` is gitignored and `.env.example` holds only placeholder values |
+| Input handling | Django form and serializer validation; ORM-parameterised queries |
+| Auditing | Audit log for administrative and configuration actions |
+| Data at rest | Encryption where the deployment environment supports it; regular backups |
+
+The FIRMS data itself is public and non-sensitive. Security effort is therefore concentrated where
+real risk lives: **user accounts, API credentials, administrative actions, and any private
+operational data** an adopting organisation adds.
+
+## Known limitations
+
+Stated plainly, because a system whose limits are understood is more trustworthy than one whose
+limits are hidden.
+
+- **A hotspot is a pixel, not an address.** VIIRS resolves to ~375 m. We can identify an affected
+  area, not an individual building.
+- **Detection is limited to satellite overpasses.** A location is observed a handful of times per
+  day. A fire that starts and is extinguished between overpasses is never seen. **This is not a
+  real-time fire detection system.**
+- **Cloud cover and dense smoke suppress detections,** which matters most during the monsoon.
+- **Small or low-temperature fires fall below the detection threshold** and are invisible to the
+  entire pipeline.
+- **Validation is corridor-scoped.** The system runs statewide, but our labelled data comes from a
+  petrochemical corridor. Performance may not transfer cleanly to clusters with different thermal
+  signatures, such as ceramic manufacturing at Morbi or ship-breaking at Alang. Extending validation
+  is Phase 5 work.
+- **OpenStreetMap coverage is uneven.** An unmapped factory yields a misleading distance feature, and
+  the reported facility type is only as accurate as its OSM tag. We treat OSM as good evidence, not
+  as an authoritative industrial register.
+- **ESA WorldCover reflects its production year,** so recent land use change is not captured.
+- **A short observation window weakens the strongest feature.** Without a `MAP_KEY` the system sees
+  roughly a week of data, so recurrence cannot exceed about 6 and FRP variability is estimated from
+  very few samples. Continuous industrial processes such as steel furnaces can therefore be scored as
+  fires rather than persistent sources. The 90-day archive resolves this, and it is the single
+  highest-value upgrade to the current prototype.
+- **No accuracy is claimed for v1.** The rule thresholds are informed estimates awaiting validation
+  against a labelled test set. Any performance figures will be published only once that set exists.
+- **This is a screening and prioritisation layer,** intended to help authorities direct attention. It
+  does not replace ground sensors, plant safety systems, or fire services.
+
+## Team
+
+**Team AsyncMavericks_SIH0162**
+
+<!-- FILL IN: roles for each member -->
+
+| Name | Role |
+|---|---|
+| Preksha Parekh | |
+| Jyot Bhavnani | |
+| Dharma Savani | |
+| Deepak Goraya | |
+| Harshal Mehta | |
+| Sherwin Dacosta | |
+
+## Data attribution and licensing
+
+This project uses publicly available data. Users of this repository must respect the terms of each
+source:
+
+- **NASA FIRMS** — data courtesy of NASA's Fire Information for Resource Management System, part of
+  NASA's Earth Science Data and Information System (ESDIS).
+- **OpenStreetMap** — © OpenStreetMap contributors, available under the
+  [Open Database License (ODbL)](https://www.openstreetmap.org/copyright). Note that ODbL carries
+  share-alike obligations for derived databases.
+- **ESA WorldCover** — © ESA WorldCover project, licensed under CC BY 4.0.
+- **Copernicus Sentinel data** — contains modified Copernicus Sentinel data, processed by this project.
+- **Esri World Imagery** — Tiles © Esri, sourced from Esri, Maxar, Earthstar Geographics and the GIS
+  User Community.
+- **BharatViz** — Indian district and state boundary GeoJSON from the
+  [BharatViz project](https://github.com/saketlab/bharatviz), used under the MIT License.
+
+Project code is released under the MIT License. <!-- FILL IN: confirm licence choice -->

@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Django
+db.sqlite3
+db.sqlite3-journal
+/staticfiles/
+media/
+
+# Cached geospatial layers (large, regenerable)
+data/*.geojson
+data/*.tif
+data/*.csv
+!data/.gitkeep
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Notebooks
+.ipynb_checkpoints/
+
+# md-files
+PPT_TECH_CONTENT.md
+.claude 

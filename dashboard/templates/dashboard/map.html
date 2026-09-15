@@ -1,0 +1,271 @@
+{% extends "dashboard/base.html" %}
+
+{% block content %}
+<div class="flex h-full flex-col">
+
+  <header class="z-20 flex shrink-0 items-center justify-between border-b border-slate-200 bg-white px-5 py-2.5 shadow-sm">
+    <div class="flex items-baseline gap-3">
+      <h1 class="text-lg font-bold tracking-tight text-slate-900">
+        Agni<span class="text-orange-600">Drishti</span>
+      </h1>
+      <p class="hidden text-xs text-slate-500 md:block">
+        AI-assisted classification of industrial fires and persistent thermal sources
+      </p>
+    </div>
+    <div class="flex items-center gap-4 text-[11px] text-slate-500">
+      <span class="rounded bg-slate-100 px-2 py-1 font-medium">PS 26162 &middot; NTRO</span>
+      <span class="rounded bg-slate-100 px-2 py-1 font-medium">AsyncMavericks_SIH0162</span>
+      <span><b class="text-slate-800">{{ total_sites }}</b> sites</span>
+      <span><b class="text-slate-800">{{ total_detections }}</b> detections</span>
+    </div>
+  </header>
+
+  {% if not has_data %}
+  <div class="border-b border-amber-200 bg-amber-50 px-5 py-2 text-[13px] text-amber-800">
+    No data ingested yet. Run
+    <code class="rounded bg-amber-100 px-1 font-mono">python manage.py load_context_layers</code>
+    then
+    <code class="rounded bg-amber-100 px-1 font-mono">python manage.py ingest_firms --days 90</code>.
+  </div>
+  {% endif %}
+
+  <div class="flex min-h-0 flex-1" x-data="dashboard()">
+
+    <!-- Filters -->
+    <aside class="flex w-64 shrink-0 flex-col gap-4 overflow-y-auto scroll-thin border-r border-slate-200 bg-white p-4">
+
+      <div>
+        <p class="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400">Classification</p>
+        <div class="space-y-1.5">
+          {% for row in summary %}
+          <label class="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 hover:bg-slate-50">
+            <input type="checkbox" value="{{ row.key }}" x-model="labels" @change="refresh()"
+                   class="h-3.5 w-3.5 rounded border-slate-300">
+            <span class="h-2.5 w-2.5 shrink-0 rounded-full" style="background: {{ row.colour }}"></span>
+            <span class="flex-1 text-[13px]">{{ row.label }}</span>
+            <span class="font-mono text-[11px] text-slate-400">{{ row.count }}</span>
+          </label>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div>
+        <label class="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+          Minimum peak FRP &mdash; <span class="font-mono text-orange-600" x-text="minFrp + ' MW'"></span>
+        </label>
+        <input type="range" min="0" max="100" step="5" x-model="minFrp" @change="refresh()" class="w-full accent-orange-600">
+      </div>
+
+      <div>
+        <label class="mb-1 block text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+          Minimum recurrence &mdash; <span class="font-mono text-orange-600" x-text="minRec + ' days'"></span>
+        </label>
+        <input type="range" min="0" max="90" step="1" x-model="minRec" @change="refresh()" class="w-full accent-orange-600">
+        <p class="mt-1 text-[11px] leading-snug text-slate-400">
+          Raise this to isolate persistent sources from one-off events.
+        </p>
+      </div>
+
+      <div>
+        <p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">FIRMS confidence</p>
+        <div class="space-y-1">
+          {% for c in "high,nominal,low"|slice:":0" %}{% endfor %}
+          <label class="flex items-center gap-2 text-[13px]"><input type="checkbox" value="high" x-model="conf" @change="refresh()" class="h-3.5 w-3.5 rounded border-slate-300"> high</label>
+          <label class="flex items-center gap-2 text-[13px]"><input type="checkbox" value="nominal" x-model="conf" @change="refresh()" class="h-3.5 w-3.5 rounded border-slate-300"> nominal</label>
+          <label class="flex items-center gap-2 text-[13px]"><input type="checkbox" value="low" x-model="conf" @change="refresh()" class="h-3.5 w-3.5 rounded border-slate-300"> low</label>
+        </div>
+      </div>
+
+      <div class="mt-auto space-y-2 border-t border-slate-200 pt-3">
+        <p class="text-[11px] leading-snug text-slate-400">
+          v1 uses a documented rule set, not a trained model. Thresholds are
+          informed estimates; no accuracy is claimed until a labelled test set exists.
+        </p>
+      </div>
+    </aside>
+
+    <!-- Map + charts -->
+    <main class="flex min-w-0 flex-1 flex-col">
+      <div class="relative min-h-0 flex-1">
+        <div id="map"></div>
+        <div class="pointer-events-none absolute bottom-5 left-3 z-10 rounded-lg border border-slate-200 bg-white/95 px-3 py-2 text-[11px] shadow">
+          <p class="mb-1 font-semibold uppercase tracking-wider text-slate-400">Legend</p>
+          {% for row in summary %}
+          <div class="flex items-center gap-1.5 leading-5">
+            <span class="h-2.5 w-2.5 rounded-full" style="background: {{ row.colour }}"></span>
+            <span>{{ row.label }}</span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="h-56 shrink-0 border-t border-slate-200 bg-white">
+        <div class="grid h-full grid-cols-3 divide-x divide-slate-200">
+          <div class="p-2"><div id="chart-dist" class="h-full"></div></div>
+          <div class="p-2"><div id="chart-time" class="h-full"></div></div>
+          <div class="p-2"><div id="chart-rec" class="h-full"></div></div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Evidence -->
+    <aside class="w-80 shrink-0 overflow-y-auto scroll-thin border-l border-slate-200 bg-white">
+      <div id="evidence">
+        <div class="p-6 text-center text-[13px] text-slate-400">
+          <p class="mb-1 text-2xl">&#9737;</p>
+          <p>Select a hotspot on the map<br>to see the evidence behind its classification.</p>
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+{{ corridor_bounds|json_script:"corridor-bounds" }}
+
+<script>
+// Alpine component for the filter sidebar.
+function dashboard() {
+  return {
+    labels: [], minFrp: 0, minRec: 0, conf: [],
+    params() {
+      const p = new URLSearchParams();
+      this.labels.forEach(l => p.append('label', l));
+      this.conf.forEach(c => p.append('confidence', c));
+      if (this.minFrp > 0) p.set('min_frp', this.minFrp);
+      if (this.minRec > 0) p.set('min_recurrence', this.minRec);
+      return p.toString();
+    },
+    refresh() {
+      const q = this.params();
+      window.loadSites(q);
+      window.loadCharts(q);
+    }
+  };
+}
+
+(function () {
+  const bounds = JSON.parse(document.getElementById('corridor-bounds').textContent);
+  const mapEl = document.getElementById('map');
+  let map = null, siteLayer = null, fitted = false;
+
+  const LAYOUT = {
+    margin: { t: 26, r: 10, b: 34, l: 38 },
+    paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)',
+    font: { size: 10, family: 'ui-sans-serif, system-ui, sans-serif' },
+    title: { font: { size: 11 }, x: 0, xanchor: 'left' }
+  };
+  const CONFIG = { displayModeBar: false, responsive: true };
+
+  function fitToData() {
+    // Frame the data itself: ingestion is statewide, so fitting the validation
+    // corridor alone would hide most of what the system classified.
+    if (siteLayer && siteLayer.getLayers().length) {
+      map.fitBounds(siteLayer.getBounds(), { padding: [30, 30] });
+    } else {
+      map.fitBounds(bounds, { padding: [24, 24] });
+    }
+  }
+
+  window.loadSites = function (query) {
+    if (!map) return;
+    fetch('/api/sites/?' + query)
+      .then(r => r.json())
+      .then(data => {
+        if (siteLayer) map.removeLayer(siteLayer);
+        siteLayer = L.geoJSON(data, {
+          pointToLayer: (feature, latlng) => {
+            const p = feature.properties;
+            // Radius encodes recurrence, so routine sources read as larger dots.
+            const radius = 4 + Math.min(6, Math.sqrt(p.recurrence || 0));
+            return L.circleMarker(latlng, {
+              radius: radius, fillColor: p.colour, color: '#fff',
+              weight: 1, opacity: 1, fillOpacity: 0.85
+            });
+          },
+          onEachFeature: (feature, layer) => {
+            const p = feature.properties;
+            layer.bindTooltip(
+              '<b>' + p.label_display + '</b><br>' +
+              p.recurrence + ' detection days &middot; ' + p.frp_max + ' MW',
+              { direction: 'top' }
+            );
+            layer.on('click', () => {
+              htmx.ajax('GET', '/site/' + p.id + '/', { target: '#evidence', swap: 'innerHTML' });
+            });
+          }
+        }).addTo(map);
+        if (!fitted) { fitToData(); fitted = true; }
+      });
+  };
+
+  window.loadCharts = function (query) {
+    fetch('/api/charts/?' + query).then(r => r.json()).then(d => {
+      Plotly.newPlot('chart-dist', [{
+        type: 'bar', orientation: 'h',
+        x: d.distribution.map(r => r.count),
+        y: d.distribution.map(r => r.label),
+        marker: { color: d.distribution.map(r => r.colour) },
+        hovertemplate: '%{y}: %{x} sites<extra></extra>'
+      }], { ...LAYOUT, title: { ...LAYOUT.title, text: 'Sites by class' },
+            yaxis: { automargin: true, tickfont: { size: 9 } } }, CONFIG);
+
+      Plotly.newPlot('chart-time', d.timeseries.map(s => ({
+        type: 'scatter', mode: 'lines+markers', name: s.label,
+        x: s.dates, y: s.counts, line: { color: s.colour, width: 1.5 },
+        marker: { size: 4 }
+      })), { ...LAYOUT, title: { ...LAYOUT.title, text: 'Detections per day' },
+             showlegend: false,
+             xaxis: { type: 'date', tickformat: '%d %b', nticks: 5, tickfont: { size: 9 } }
+           }, CONFIG);
+
+      Plotly.newPlot('chart-rec', d.recurrence.map(s => ({
+        type: 'box', name: s.label, y: s.values, marker: { color: s.colour },
+        boxpoints: false, line: { width: 1 }
+      })), { ...LAYOUT, title: { ...LAYOUT.title, text: 'Recurrence days per class' },
+             showlegend: false, xaxis: { tickangle: -20, tickfont: { size: 8 } } }, CONFIG);
+    });
+  };
+
+  function init() {
+    // Leaflet captures the container size when the map is constructed. The map is a
+    // flex child, so at parse time it reports zero height, and a map built against
+    // that leaves the tile pane translated outside the viewport -- tiles fetch with
+    // HTTP 200 and are simply never visible. Waiting for real geometry before
+    // constructing the map removes that whole class of bug, rather than patching it
+    // afterwards with invalidateSize() calls that only sometimes win the race.
+    if (!mapEl.clientHeight || !mapEl.clientWidth) {
+      requestAnimationFrame(init);
+      return;
+    }
+
+    const centre = [(bounds[0][0] + bounds[1][0]) / 2, (bounds[0][1] + bounds[1][1]) / 2];
+    map = L.map('map', { zoomControl: true }).setView(centre, 9);
+
+    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors', maxZoom: 19
+    }).addTo(map);
+
+    // Esri World Imagery uses {z}/{y}/{x} -- reversed relative to OSM.
+    const satLayer = L.tileLayer(
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      { attribution: 'Tiles &copy; Esri &mdash; Esri, Maxar, Earthstar Geographics', maxZoom: 19 }
+    );
+
+    L.control.layers({ 'OpenStreetMap': osmLayer, 'Satellite imagery': satLayer }, {},
+                     { position: 'topright', collapsed: false }).addTo(map);
+
+    L.rectangle(bounds, {
+      color: '#334155', weight: 1.5, dashArray: '6 4', fill: false, interactive: false
+    }).addTo(map).bindTooltip('Validation corridor', { sticky: true });
+
+    // Keep Leaflet in step if the pane is resized later.
+    new ResizeObserver(() => map.invalidateSize()).observe(mapEl);
+
+    window.loadSites('');
+    window.loadCharts('');
+  }
+
+  init();
+})();
+</script>
+{% endblock %}

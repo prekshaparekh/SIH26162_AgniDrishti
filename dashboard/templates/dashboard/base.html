@@ -1,0 +1,26 @@
+{% load static %}<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}AgniDrishti{% endblock %}</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.plot.ly/plotly-2.30.0.min.js" charset="utf-8"></script>
+<script src="https://unpkg.com/htmx.org@1.9.12"></script>
+<script defer src="https://unpkg.com/alpinejs@3.13.10/dist/cdn.min.js"></script>
+
+<style>
+  html, body { height: 100%; }
+  #map { height: 100%; width: 100%; z-index: 0; }
+  .scroll-thin::-webkit-scrollbar { width: 6px; }
+  .scroll-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+  .leaflet-container { font-family: ui-sans-serif, system-ui, sans-serif; }
+</style>
+</head>
+<body class="h-full bg-slate-100 text-slate-800 antialiased">
+{% block content %}{% endblock %}
+</body>
+</html>
