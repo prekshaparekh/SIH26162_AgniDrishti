@@ -16,7 +16,7 @@
 | **Title** | AI-Based Detection and Classification of Industrial Fires and Persistent Thermal Sources Using NASA FIRMS, OSM & Satellite Data |
 | **Organisation** | National Technical Research Organisation (NTRO) |
 | **Theme** | Disaster Management |
-| **Team** | AsyncMavericks_SIH0162 |
+| **Team** | AsyncMavericks_SIH26162 |
 
 ---
 
@@ -25,7 +25,7 @@
 
 - [The problem](#the-problem)
 - [What AgniDrishti does](#what-agnidrishti-does)
-- [Why the naive approaches fail](#why-the-naive-approaches-fail)
+- [Why the existing approaches fail](#why-the-existing-approaches-fail)
 - [Study region and validation scope](#study-region-and-validation-scope)
 - [How it works](#how-it-works)
 - [Classification logic (v1)](#classification-logic-v1)
@@ -82,7 +82,7 @@ time-series analytics.
 it. A user never sees a bare label. They see *"Persistent thermal source — detected on 84 of the last
 90 days, 210 m from a mapped refinery, on built-up land cover, FRP stable at 38 ± 6 MW."*
 
-## Why the naive approaches fail
+## Why the existing approaches fail
 
 This section exists because the obvious solutions are the wrong ones, and knowing why shaped the
 entire design.
@@ -589,14 +589,14 @@ limits are hidden.
 
 <!-- FILL IN: roles for each member -->
 
-| Name | Role |
-|---|---|
-| Preksha Parekh | |
-| Jyot Bhavnani | |
-| Dharma Savani | |
-| Deepak Goraya | |
-| Harshal Mehta | |
-| Sherwin Dacosta | |
+| Name |
+|---|
+| Preksha Parekh | 
+| Jyot Bhavnani | 
+| Dharma Savani | 
+| Deepak Goraya | 
+| Harshal Mehta | 
+| Sherwin Dacosta | 
 
 ## Data attribution and licensing
 
