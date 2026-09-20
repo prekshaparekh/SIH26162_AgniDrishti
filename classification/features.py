@@ -30,6 +30,7 @@ def extract(event, site=None) -> EventFeatures:
         industrial_group=site.industrial_group,
         land_context=site.land_context,
         landcover_frac_builtup=site.landcover_frac_builtup,
+        landcover_frac_built_only=site.landcover_frac_built_only,
         site_event_count=site.event_count,
         site_recurrence_days=site.recurrence_days,
         site_max_event_duration=site.max_event_duration,

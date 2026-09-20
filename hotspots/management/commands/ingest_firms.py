@@ -52,6 +52,13 @@ class Command(BaseCommand):
             action="store_true",
             help="Skip fetching; re-enrich and re-classify existing sites.",
         )
+        parser.add_argument(
+            "--reuse-context",
+            action="store_true",
+            help="Reuse the stored OSM distance and land cover instead of recomputing "
+                 "them. Intended for iterating on classification rules: enrichment is "
+                 "the slow part and does not change when only the rules do.",
+        )
 
     def handle(self, *args, **options):
         bbox = (
@@ -73,6 +80,7 @@ class Command(BaseCommand):
         self._enrich_and_classify(
             bbox, data_dir, options["bbox"], window_days,
             use_worldcover=not options["no_worldcover"],
+            reuse_context=options["reuse_context"],
         )
 
     # --- fetch -----------------------------------------------------------------
@@ -156,22 +164,35 @@ class Command(BaseCommand):
     # --- enrich + classify -----------------------------------------------------
 
     def _enrich_and_classify(
-        self, bbox, data_dir, bbox_name, window_days=90, use_worldcover=True
+        self, bbox, data_dir, bbox_name, window_days=90, use_worldcover=True,
+        reuse_context=False,
     ):
+        enricher = None
+        if reuse_context:
+            self.stdout.write(
+                self.style.WARNING(
+                    "Reusing stored context: OSM distance and land cover are NOT "
+                    "recomputed. Episodes and labels are."
+                )
+            )
+            use_worldcover = False
+
         industrial_cache = data_dir / f"osm_industrial_{bbox_name}.json"
         landuse_cache = data_dir / f"osm_landuse_{bbox_name}.json"
-        if not industrial_cache.exists():
+        if not reuse_context and not industrial_cache.exists():
             raise CommandError(
                 f"Context layers missing ({industrial_cache}). "
                 "Run: python manage.py load_context_layers"
             )
 
-        industrial = osm.fetch_industrial(bbox, industrial_cache)
-        landuse = osm.to_polygons(osm.fetch_landuse(bbox, landuse_cache))
-        self.stdout.write(
-            f"Context: {len(industrial)} industrial features, {len(landuse)} land-use polygons."
-        )
-        enricher = ContextEnricher(industrial, landuse)
+        if not reuse_context:
+            industrial = osm.fetch_industrial(bbox, industrial_cache)
+            landuse = osm.to_polygons(osm.fetch_landuse(bbox, landuse_cache))
+            self.stdout.write(
+                f"Context: {len(industrial)} industrial features, "
+                f"{len(landuse)} land-use polygons."
+            )
+            enricher = ContextEnricher(industrial, landuse)
 
         # The nominal window is what we asked for; the observed span is what the
         # feed actually returned. Recurrence can never exceed the latter, so the
@@ -206,7 +227,7 @@ class Command(BaseCommand):
         # Land cover is sampled for every site in one batch, because WorldCover
         # groups points by raster tile and opens each tile once. Doing it per site
         # would reopen the same remote raster hundreds of times.
-        land_cover: list[tuple[str, float]] = [("unknown", 0.0)] * total
+        land_cover: list[tuple[str, float, float]] = [("unknown", 0.0, 0.0)] * total
         if use_worldcover and total:
             self.stdout.write("Sampling ESA WorldCover (10 m)...")
             try:
@@ -229,26 +250,28 @@ class Command(BaseCommand):
             # be judged before we know what is under it and what is near it.
             events = clustering.rebuild_site_events(site, latest_date=latest_date)
 
-            match = enricher.nearest_industrial(site.latitude, site.longitude)
-            site.dist_industrial_m = match.distance_m
-            site.industrial_group = match.group
-            site.industrial_name = match.name[:200]
-            # WorldCover is wall-to-wall, so it answers for almost every site.
-            # OSM land-use remains the fallback for the rare gap.
-            context, built_fraction = land_cover[index - 1]
-            if context != "unknown":
-                land_sources["worldcover"] += 1
-            else:
-                # The OSM land-use fallback is polygon-based and cannot report a
-                # footprint fraction, so the rules fall back to the class alone.
-                context = enricher.land_context(site.latitude, site.longitude)
-                built_fraction = 0.0
-                land_sources["osm" if context != "unknown" else "none"] += 1
-            site.land_context = context
-            site.landcover_frac_builtup = built_fraction
-            site.in_validation_corridor = in_bbox(
-                site.latitude, site.longitude, settings.VALIDATION_BBOX
-            )
+            if not reuse_context:
+                match = enricher.nearest_industrial(site.latitude, site.longitude)
+                site.dist_industrial_m = match.distance_m
+                site.industrial_group = match.group
+                site.industrial_name = match.name[:200]
+                # WorldCover is wall-to-wall, so it answers for almost every site.
+                # OSM land-use remains the fallback for the rare gap.
+                context, built_fraction, built_only = land_cover[index - 1]
+                if context != "unknown":
+                    land_sources["worldcover"] += 1
+                else:
+                    # The OSM land-use fallback is polygon-based and cannot report a
+                    # footprint fraction, so the rules fall back to the class alone.
+                    context = enricher.land_context(site.latitude, site.longitude)
+                    built_fraction = built_only = 0.0
+                    land_sources["osm" if context != "unknown" else "none"] += 1
+                site.land_context = context
+                site.landcover_frac_builtup = built_fraction
+                site.landcover_frac_built_only = built_only
+                site.in_validation_corridor = in_bbox(
+                    site.latitude, site.longitude, settings.VALIDATION_BBOX
+                )
 
             # Now that the site carries its context, judge each episode on its
             # own, then summarise the location from what they say.
@@ -277,6 +300,7 @@ class Command(BaseCommand):
                 "recurrence_days", "night_fraction", "frp_mean", "frp_max", "frp_cv",
                 "brightness_max", "best_confidence", "dist_industrial_m", "industrial_group",
                 "industrial_name", "land_context", "landcover_frac_builtup",
+                "landcover_frac_built_only",
                 "label", "label_confidence", "evidence",
                 "matched_rule", "in_validation_corridor", "enriched_at",
                 "event_count", "max_event_duration", "longest_episode_active_days",

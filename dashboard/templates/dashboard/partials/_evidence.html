@@ -40,6 +40,28 @@
     {% endif %}
   </div>
 
+  {% if site.review_label %}
+  <div class="rounded-lg border p-3 {% if site.review_agrees %}border-slate-200 bg-slate-50{% else %}border-amber-300 bg-amber-50{% endif %}">
+    <div class="mb-1 flex items-center justify-between gap-2">
+      <p class="text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+        Reviewer annotation
+      </p>
+      <span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium
+        {% if site.review_agrees %}bg-emerald-100 text-emerald-700{% else %}bg-amber-200 text-amber-800{% endif %}">
+        {% if site.review_agrees %}agrees with v1{% else %}differs from v1{% endif %}
+      </span>
+    </div>
+    <p class="text-[13px] font-semibold" style="color: {{ site.colour }}">
+      {{ site.get_review_label_display }}
+    </p>
+    <p class="mt-1 text-[12px] leading-snug text-slate-600">{{ site.review_note }}</p>
+    <p class="mt-2 border-t border-slate-200 pt-2 text-[10px] leading-snug text-slate-500">
+      {{ site.get_review_source_display }}. Not ground truth: no accuracy figure may
+      be derived from these labels until they are verified against imagery.
+    </p>
+  </div>
+  {% endif %}
+
   <div class="grid grid-cols-2 gap-2 text-[13px]">
     <div class="rounded-lg border border-slate-200 p-2">
       <p class="text-[11px] text-slate-400">Recurrence</p>

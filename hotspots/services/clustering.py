@@ -204,9 +204,21 @@ def rebuild_site_events(
     return events
 
 
-# Operational priority for the map's one colour per location. This is an ordering
-# by how much attention a finding warrants, not by confidence or recency.
-SUMMARY_PRIORITY = ["industrial_fire", "persistent_source", "vegetation_fire", "uncertain"]
+# Operational priority for the map's one colour per location: how much attention a
+# finding warrants, not how confident or how recent it is.
+#
+# Vegetation and abstention share a tier deliberately. Ranking "vegetation fire"
+# above "uncertain" outright let a trivial episode mask a serious one: site #4 near
+# Hazira has a 7-day grass fire and a 71-day unexplained burn that the vegetation
+# label could not account for, and the site rendered green on the strength of the
+# 7-day one. Neither class is actionable on its own, so within the tier the larger
+# episode is the more informative thing to show.
+SUMMARY_TIERS = {
+    "industrial_fire": 0,
+    "persistent_source": 1,
+    "vegetation_fire": 2,
+    "uncertain": 2,
+}
 
 
 def summarise_site_from_events(site: Site, events: list[Event]) -> None:
@@ -229,13 +241,10 @@ def summarise_site_from_events(site: Site, events: list[Event]) -> None:
     if not events:
         return
 
-    def rank(event: Event) -> tuple[int, int]:
-        try:
-            severity = SUMMARY_PRIORITY.index(event.label)
-        except ValueError:
-            severity = len(SUMMARY_PRIORITY)
-        # Lowest severity index wins; among equals, the most recent.
-        return severity, -event.end_date.toordinal()
+    def rank(event: Event) -> tuple[int, int, int]:
+        tier = SUMMARY_TIERS.get(event.label, max(SUMMARY_TIERS.values()) + 1)
+        # Lowest tier wins; among equals the longest episode, then the most recent.
+        return tier, -event.duration_days, -event.end_date.toordinal()
 
     chosen = min(events, key=rank)
     site.label = chosen.label

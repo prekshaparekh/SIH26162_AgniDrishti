@@ -70,10 +70,22 @@ one of four classes, together with the evidence behind that decision:
 
 | Class | Meaning | Typical signature |
 |---|---|---|
-| 🔴 **Industrial fire** | A probable unplanned fire event on industrial land | High FRP, industrial land cover, **low** historical recurrence |
+| 🟣 **Industrial fire** | A probable unplanned fire event on industrial land | High FRP, industrial land cover, **low** historical recurrence |
 | 🟠 **Persistent thermal source** | Routine, continuous industrial heat — flares, furnaces, kilns | Stable FRP, industrial land cover, **high** recurrence at the same location |
-| 🟢 **Vegetation fire** | Crop residue, forest, grassland or scrub burning | Vegetated/cropland land cover, away from industrial infrastructure |
+| 🔴 **Vegetation fire** | Crop residue, forest, grassland or scrub burning | Vegetated/cropland land cover, away from industrial infrastructure |
 | ⚪ **Other / uncertain** | Signal present, context insufficient or contradictory | Low confidence, conflicting features, landfill/unmapped sites |
+
+**Map legend colours** (defined once in `CLASS_COLOURS`, `hotspots/models.py`):
+
+| Class | Swatch | Hex |
+|---|---|---|
+| Industrial fire | 🟣 purple | `#7c3aed` |
+| Persistent thermal source | 🟠 orange | `#ea580c` |
+| Vegetation fire | 🔴 red | `#dc2626` |
+| Other / uncertain | ⚪ grey | `#9ca3af` |
+
+Every surface — map markers, legend, sidebar filters, evidence panel and all three charts — reads
+from that single dictionary, so the palette cannot drift between views.
 
 Outputs are delivered through an interactive map with filtering, per-hotspot evidence panels, and
 time-series analytics.

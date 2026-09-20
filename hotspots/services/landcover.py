@@ -55,8 +55,11 @@ TILE_SIZE_DEG = 3
 # whole square rather than at its centre point.
 VIIRS_FOOTPRINT_M = 375.0
 
-# Classes the rules treat as industrial ground.
+# Classes the rules treat as industrial ground. Bare counts here because a furnace
+# yard, a slag heap and a quarry all read as bare -- but see BUILT_ONLY: a fire
+# needs something to burn, and bare ground on its own is not evidence of that.
 BUILT_CLASSES = ("built_up", "bare")
+BUILT_ONLY = ("built_up",)
 
 
 def tile_name(lat: float, lon: float) -> str:
@@ -72,17 +75,19 @@ def tile_url(name: str) -> str:
     return f"{WORLDCOVER_BASE}/ESA_WorldCover_10m_2021_v200_{name}_Map.tif"
 
 
-def _summarise(block) -> tuple[str, float]:
-    """Majority class and built-up fraction for one footprint of raster values."""
+def _summarise(block) -> tuple[str, float, float]:
+    """Majority class, industrial-ground fraction, and built-up-only fraction."""
     from collections import Counter
 
     values = [int(v) for v in block.flatten() if v]
     if not values:
-        return "unknown", 0.0
+        return "unknown", 0.0, 0.0
     classes = [WORLDCOVER_CLASSES.get(v, "unknown") for v in values]
     counts = Counter(classes)
-    built = sum(counts[c] for c in BUILT_CLASSES) / len(classes)
-    return counts.most_common(1)[0][0], built
+    total = len(classes)
+    built = sum(counts[c] for c in BUILT_CLASSES) / total
+    built_only = sum(counts[c] for c in BUILT_ONLY) / total
+    return counts.most_common(1)[0][0], built, built_only
 
 
 class WorldCoverProvider:
@@ -105,12 +110,14 @@ class WorldCoverProvider:
 
     def sample(
         self, points: list[tuple[float, float]], footprint_m: float = VIIRS_FOOTPRINT_M
-    ) -> list[tuple[str, float]]:
+    ) -> list[tuple[str, float, float]]:
         """Land cover across each point's detection footprint.
 
-        Returns ``(majority_class, built_fraction)`` per point, in input order.
-        ``built_fraction`` is the share of the footprint that is built-up or bare,
-        matching what the rules treat as industrial ground.
+        Returns ``(majority_class, built_fraction, built_only_fraction)`` per
+        point, in input order. ``built_fraction`` is the share that is built-up or
+        bare -- industrial ground as Rule 2 understands it. ``built_only_fraction``
+        excludes bare, because a fire needs structures to burn and bare ground on
+        its own is not evidence of any.
 
         **Why a footprint and not a point.** This method used to read a single
         10 m pixel at the detection centroid. A VIIRS detection covers about
@@ -128,7 +135,7 @@ class WorldCoverProvider:
         import rasterio
         from rasterio.windows import from_bounds
 
-        results: list[tuple[str, float]] = [("unknown", 0.0)] * len(points)
+        results: list[tuple[str, float, float]] = [("unknown", 0.0, 0.0)] * len(points)
         by_tile: dict[str, list[int]] = {}
         for index, (lat, lon) in enumerate(points):
             by_tile.setdefault(tile_name(lat, lon), []).append(index)

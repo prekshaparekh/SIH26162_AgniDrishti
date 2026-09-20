@@ -73,6 +73,19 @@ VEGETATED_CONTEXTS = {"tree_cover", "grass_shrub", "cropland"}
 # not eligible to be called a vegetation fire.
 BUILT_FRACTION_THRESHOLD = 0.5
 
+# Vegetation burns for days, not weeks. Cropland and scrub in Gujarat are consumed
+# in hours; even a forest fire is over long before a month. An episode that keeps
+# producing detections across a span this long is therefore evidence that the land
+# cover reading is wrong, not that the vegetation is unusually persistent -- three
+# pixels inside the Hazira steel plant came back "tree cover" and were reported as
+# vegetation fires burning for 40, 41 and 71 days.
+#
+# The response is to abstain, not to assert the opposite. We know enough to say the
+# vegetation label is not credible; we do not know enough to call it industrial,
+# and the footprint here really is mostly vegetated. These are exactly the cases
+# the annotation queue should see first.
+VEGETATION_IMPLAUSIBLE_SPAN = 20
+
 
 def _distance_phrase(distance: float | None) -> str:
     if distance is None:
@@ -111,6 +124,21 @@ class EventRuleClassifier(Classifier):
         mostly_built = features.landcover_frac_builtup >= BUILT_FRACTION_THRESHOLD
         built = features.land_context in BUILT_CONTEXTS or mostly_built
         vegetated = features.land_context in VEGETATED_CONTEXTS and not mostly_built
+
+        # Rule 3 needs a stricter test than Rule 2. `built` counts bare ground as
+        # industrial, which is right for a furnace yard, a slag heap or a quarry --
+        # those are real persistent sources. It is wrong for a fire: a fire needs
+        # something to burn, and bare ground on its own is not evidence of any.
+        #
+        # Three of the four industrial fires reported before this rule existed sat
+        # on the bare scrubland of the Dholera Solar Park, and their footprints
+        # contain 0% built-up pixels across the full 375 m. There is no structure
+        # there. The centre-pixel class is still accepted on its own because it is
+        # the one reading we know is taken inside the detection.
+        on_structures = (
+            features.land_context == "built_up"
+            or features.landcover_frac_built_only >= BUILT_FRACTION_THRESHOLD
+        )
 
         base_evidence = [
             _span_phrase(features),
@@ -191,12 +219,14 @@ class EventRuleClassifier(Classifier):
         # persistent label would have hidden it.
         if (
             near_industry
-            and built
+            and on_structures
             and features.duration_days <= self.brief_max
             and features.frp_max >= INDUSTRIAL_FIRE_MIN_FRP
         ):
             evidence = [
                 f"brief and energetic: {_span_phrase(features)}",
+                f"built-up ground: {features.landcover_frac_built_only:.0%} of the "
+                f"footprint carries structures",
                 f"peak FRP {features.frp_max:.1f} MW",
             ]
             if features.site_max_event_duration >= self.sustained_min:
@@ -229,6 +259,28 @@ class EventRuleClassifier(Classifier):
         # nearby. A hot pixel on cropland is cropland burning, whatever sits next
         # door. Proximity still lowers confidence, because WorldCover can misread a
         # small facility as the vegetation around it.
+        if vegetated and features.duration_days >= VEGETATION_IMPLAUSIBLE_SPAN:
+            evidence = [
+                f"land cover reads {features.land_context.replace('_', ' ')}, but the "
+                f"episode ran {features.duration_days} days - too long for vegetation, "
+                f"which burns in hours to days",
+                _span_phrase(features),
+                _land_phrase(features),
+                _distance_phrase(distance),
+            ]
+            if near_industry:
+                evidence.append(
+                    f"mapped industry {distance:.0f} m away "
+                    f"({features.industrial_group.replace('_', ' ')}) - the land cover "
+                    f"reading is the likely error"
+                )
+            return Classification(
+                label="uncertain",
+                confidence="low",
+                evidence=evidence,
+                matched_rule="R4b: vegetation label implausible for the span",
+            )
+
         if vegetated:
             confidence = "medium" if features.confidence == "high" else "low"
             evidence = [
@@ -259,6 +311,18 @@ class EventRuleClassifier(Classifier):
                 f"centre pixel reads {features.land_context.replace('_', ' ')}, but "
                 f"{features.landcover_frac_builtup:.0%} of the footprint is built-up "
                 f"or bare - too contradictory to call a vegetation fire"
+            )
+        elif (
+            near_industry
+            and built
+            and not on_structures
+            and features.duration_days <= self.brief_max
+            and features.frp_max >= INDUSTRIAL_FIRE_MIN_FRP
+        ):
+            reason = (
+                f"brief and energetic in an industrial area, but only "
+                f"{features.landcover_frac_built_only:.0%} of the footprint is "
+                f"built-up - bare ground alone is not something that burns"
             )
         elif near_industry and built and features.duration_days <= self.brief_max:
             # It was brief enough to be a fire; the energy was the missing part.

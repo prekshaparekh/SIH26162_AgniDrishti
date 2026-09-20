@@ -25,9 +25,10 @@ class SiteAdmin(admin.ModelAdmin):
         "id", "latitude", "longitude", "label", "recurrence_days",
         "event_count", "max_event_duration", "has_ongoing_event",
         "frp_max", "dist_industrial_m", "land_context",
+        "review_label", "review_agrees",
     )
     list_filter = (
-        "label", "land_context", "industrial_group",
+        "label", "review_source", "review_label", "land_context", "industrial_group",
         "in_validation_corridor", "has_ongoing_event",
     )
     search_fields = ("grid_key", "industrial_name")

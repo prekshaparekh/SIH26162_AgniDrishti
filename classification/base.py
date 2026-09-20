@@ -49,6 +49,7 @@ class EventFeatures:
     industrial_group: str
     land_context: str
     landcover_frac_builtup: float
+    landcover_frac_built_only: float
 
     # --- what is normal at this location ---
     site_event_count: int

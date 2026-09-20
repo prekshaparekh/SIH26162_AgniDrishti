@@ -66,11 +66,27 @@ class HotspotClass(models.TextChoices):
 
 
 CLASS_COLOURS = {
-    HotspotClass.INDUSTRIAL_FIRE: "#dc2626",
-    HotspotClass.PERSISTENT_SOURCE: "#ea580c",
-    HotspotClass.VEGETATION_FIRE: "#16a34a",
-    HotspotClass.UNCERTAIN: "#9ca3af",
+    HotspotClass.INDUSTRIAL_FIRE: "#7c3aed",    # purple
+    HotspotClass.PERSISTENT_SOURCE: "#ea580c",  # orange
+    HotspotClass.VEGETATION_FIRE: "#dc2626",    # red
+    HotspotClass.UNCERTAIN: "#9ca3af",          # grey
 }
+
+
+class ReviewSource(models.TextChoices):
+    """Where a review label came from. Provenance is not optional here.
+
+    The project's stated method is that labels are assigned from Sentinel-2 imagery
+    and map evidence, never from proximity alone, and that no accuracy figure is
+    published until a human-verified test set exists. Recording how each label was
+    produced is what keeps that promise auditable: an ``ASSISTANT`` label is a
+    pre-annotation to be corrected, not ground truth, and must never be counted as
+    though it were.
+    """
+
+    UNREVIEWED = "unreviewed", "Not reviewed"
+    ASSISTANT = "assistant", "AI pre-annotation - map evidence only, no imagery"
+    HUMAN = "human", "Human verified against imagery"
 
 
 class Site(models.Model):
@@ -130,6 +146,12 @@ class Site(models.Model):
     land_context = models.CharField(
         max_length=20, choices=LandContext.choices, default=LandContext.UNKNOWN
     )
+    landcover_frac_built_only = models.FloatField(
+        default=0.0,
+        help_text="Share of the footprint that is the Built-up class specifically, "
+                  "excluding bare ground. An industrial fire needs structures; bare "
+                  "scrubland beside a mapped works is not evidence of any.",
+    )
     landcover_frac_builtup = models.FloatField(
         default=0.0,
         help_text="Share of the ~375 m detection footprint that is built-up or bare. "
@@ -151,6 +173,28 @@ class Site(models.Model):
 
     in_validation_corridor = models.BooleanField(default=False, db_index=True)
     enriched_at = models.DateTimeField(null=True, blank=True)
+
+    # --- annotation ---
+    # Deliberately never written by the ingest pipeline: a review survives
+    # re-classification, which is the whole point of collecting one. Agreement
+    # between `label` and `review_label` is a disagreement rate, not an accuracy,
+    # until review_source is HUMAN.
+    review_label = models.CharField(
+        max_length=32, choices=HotspotClass.choices, blank=True,
+        help_text="Reviewer's classification, independent of the rule output",
+    )
+    review_source = models.CharField(
+        max_length=16, choices=ReviewSource.choices, default=ReviewSource.UNREVIEWED,
+        db_index=True,
+    )
+    review_note = models.TextField(blank=True, help_text="Why the reviewer decided this")
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+    @property
+    def review_agrees(self) -> bool | None:
+        if not self.review_label:
+            return None
+        return self.review_label == self.label
 
     class Meta:
         ordering = ["-recurrence_days", "-frp_max"]
