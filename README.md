@@ -150,11 +150,12 @@ The bounding boxes are configuration values. Widening either one is a config cha
 flowchart TD
     A["NASA FIRMS<br/>VIIRS thermal anomalies"] --> B[Ingest and deduplicate]
     B --> C[Spatial clustering<br/>group detections into persistent sites]
-    C --> D{Context enrichment}
+    C --> C2["Episode segmentation<br/>cut each history into continuous burns"]
+    C2 --> D{Context enrichment}
 
     E["OpenStreetMap<br/>industrial infrastructure"] --> D
     F["ESA WorldCover<br/>10 m land cover"] --> D
-    G["Detection history<br/>recurrence and FRP stability"] --> D
+    G["Detection history<br/>recurrence, episode length, FRP stability"] --> D
 
     D --> H[Feature vector per site]
     H --> I["Classifier<br/>v1: transparent rules<br/>v2: Random Forest"]
@@ -169,11 +170,46 @@ flowchart TD
    rolling 90-day archive.
 2. **Cluster** — group detections falling within a small radius into a single persistent *site*, so
    that history accumulates per location rather than per pixel.
-3. **Enrich** — for each site, compute distance to the nearest mapped industrial feature (OSM), read
+3. **Segment** — cut each site's history into *episodes*: runs of detections bounded by quiet gaps.
+   This is what separates one sustained burn from several unrelated short ones at the same place.
+4. **Enrich** — for each site, compute distance to the nearest mapped industrial feature (OSM), read
    the land cover class beneath it (ESA WorldCover), and derive temporal statistics from its history.
-4. **Classify** — apply the rule set below, producing a class, a confidence score, and the list of
+5. **Classify** — apply the rule set below, producing a class, a confidence score, and the list of
    features that drove it.
-5. **Visualise** — render on an interactive map with supporting charts.
+6. **Visualise** — render on an interactive map with supporting charts.
+
+### Data model — three tables
+
+The schema is the argument. Each table exists because the one below it cannot answer a question the
+system needs answered.
+
+| Table | One row is | Why it exists |
+|---|---|---|
+| `Detection` | One thermal anomaly reported by FIRMS at one instant | The raw observation |
+| `Event` | One continuous burning episode at a location | A site's counters cannot distinguish *when* its detection days fell |
+| `Site` | A location that has produced detections over time | A single detection cannot separate a flare from an accident |
+
+**Why `Event` is not optional.** A site that burns for three days in March and two days in May
+records `recurrence_days = 5` — the same value as one unbroken five-day burn, and the same value as
+five scattered single days across three months. Three entirely different situations, compressed into
+one number. That information is destroyed during feature extraction, which means **no classifier can
+recover it, however good the model.** Episodes preserve the arrangement:
+
+```
+Site #2 · Hazira
+├─ Event 1   21 Jun → 27 Jun    7-day span,  6 days active   (density 0.86)
+│            ← 11 days quiet →
+└─ Event 2   08 Jul → 18 Sep   73-day span, 42 days active   (density 0.58)  ongoing
+```
+
+Episodes are cut wherever a site falls quiet for longer than `EVENT_GAP_DAYS` (default 10). The
+threshold is deliberately generous: FIRMS cannot see through cloud, and Gujarat's monsoon covers most
+of our observation window, so a continuously-operating furnace goes dark for days at a time. At a
+7-day threshold the Hazira steel plant already fragments into three episodes. **A quiet gap is
+evidence of absence only when it is long.**
+
+Events are rebuilt from scratch on every ingest rather than appended to, which keeps the pipeline
+idempotent: late-arriving detections can close a gap that previously split one burn in two.
 
 ## Classification logic (v1)
 
@@ -189,23 +225,36 @@ which is how we intend to reach a usable training set efficiently.
 | Priority | Rule | Assigned class |
 |---|---|---|
 | 1 | VIIRS confidence is `low` | Other / uncertain |
-| 2 | Recurrence ≥ persistent threshold **and** ≤ 1 km from industrial feature **and** land cover ∈ {Built-up, Bare} **and** FRP coefficient of variation < 0.5 | Persistent thermal source |
-| 3 | ≤ 1 km from industrial feature **and** land cover ∈ {Built-up, Bare} **and** FRP ≥ 10 MW **and** (recurrence ≤ episodic threshold **or** FRP coefficient of variation ≥ 0.5) | Industrial fire |
+| 2 | ≤ 1 km from industrial feature **and** land cover ∈ {Built-up, Bare} **and** *either* recurrence ≥ persistent threshold *or* longest episode ≥ persistent threshold with density ≥ 0.25 | Persistent thermal source |
+| 3 | ≤ 1 km from industrial feature **and** land cover ∈ {Built-up, Bare} **and** peak FRP ≥ 10 MW **and** recurrence ≤ episodic threshold | Industrial fire |
 | 4 | Land cover ∈ {Tree cover, Shrubland, Grassland, Cropland} | Vegetation fire |
 | 5 | None of the above | Other / uncertain |
 
-**Recurrence thresholds are relative to the observation window.** "Detected on 20 days" means
-something entirely different over a 90-day archive than over a 7-day feed, so the thresholds are
-held as fractions of the window (20/90 and 3/90) with floors that stop a short window producing
-statistically meaningless rules. Over 90 days they reproduce the documented 20 and 3 days exactly.
+**Thresholds are relative to the observation window.** "Detected on 20 days" means something
+entirely different over a 90-day archive than over a 7-day feed, so they are held as fractions of the
+window (20/90 and 3/90) with floors that stop a short window producing statistically meaningless
+rules. Over 90 days they reproduce the documented 20 and 3 days exactly. Rule 2's episode threshold
+reuses the same persistent value, measured as a span rather than a day count.
 
-**Two design decisions in these rules are worth stating explicitly**, because the obvious
-alternatives are wrong:
+**Three design decisions in these rules are worth stating explicitly**, because the obvious
+alternatives are wrong — and in two cases were what we built first.
 
-*Rule 3 tests instability, not just rarity.* Anything reaching it has already failed Rule 2, so it is
-not a stable recurrent source. It qualifies as a fire if it is either rare **or** erratic in
-radiative power. Testing rarity alone mislabels multi-day fires as uncertain — a fire that burns for
-three days is still a fire. A flare is steady; a fire flares up and dies down.
+*Rule 2 no longer requires stable radiative power.* An earlier version demanded FRP coefficient of
+variation below 0.5, on the assumption that a flare burns steadily. Measured over 90 days that turns
+out to be false, and backwards: median CV *rises* with recurrence (0.32 for episodic sites, 0.69 for
+near-daily ones), because a site observed more often is sampled across more viewing angles,
+atmospheres and times of day. The gate was rejecting precisely the most persistent sources — every
+one of the ten most recurrent sites failed it, and the class came back empty. CV is still reported
+and still shapes confidence, but it no longer decides the class.
+
+*Rule 2 has two independent routes in, because cloud breaks recurrence but not span.* A location can
+show that it burns routinely either by being detected on many days across the window, or by burning
+within one long continuous run. Site #43 near Hazira burned inside a **41-day stretch** and is still
+burning, yet reached a recurrence of only 15 — below the threshold of 20 — because monsoon cloud
+suppressed the detections in between. The recurrence test alone abstained on it. A 41-day run is not
+an accident. The density floor guards this route: a 20-day span holding two detections is two blips
+three weeks apart, not a sustained burn. Sites admitted by episode length alone are capped at medium
+confidence and carry a distinct `matched_rule`, so they stay separable in the annotation queue.
 
 *Rule 4 lets land cover lead.* An earlier version also required the site to be more than a kilometre
 from mapped industry, which denied the vegetation label to 18 of 106 sites burning on cropland merely
@@ -230,15 +279,24 @@ class Classifier(Protocol):
 Each classified site produces one record, surfaced in the map's evidence panel:
 
 ```
-Site #1847 · 21.6412° N, 72.9903° E
+Site #2 · 21.1066° N, 72.6469° E
 Class:        Persistent thermal source   (confidence: high)
-Evidence:     detected on 84 of the last 90 days
-              FRP stable at 38 ± 6 MW (CV 0.16)
-              210 m from nearest mapped industrial feature
-              nearest feature type: petroleum refinery (OpenStreetMap)
-              land cover: Built-up · 78% built-up within 500 m
-              first seen: 2023-04-11
+Evidence:     recurs on 48 of 90 days (53% of the observed period)
+              longest continuous episode: 73 days, with detections on 58% of them
+              the current episode has not yet ended
+              FRP averages 6.9 MW (coefficient of variation 0.88)
+              489 m from nearest mapped industrial feature
+              nearest feature type: metals heavy
+              land context: bare
+
+Episodes:     21 Jun → 27 Jun    7d span,  6d active
+              ── 11 days quiet ──
+              08 Jul → 18 Sep   73d span, 42d active   [open]
 ```
+
+That is a verbatim record from the current build, not an illustration. The episode strip is rendered
+in the evidence panel as proportional bars across the observed window, with opacity tracking density
+— so a sparse run looks faint, which is how much it should be trusted.
 
 **An important distinction about industry type.** The model predicts *one of four classes* and
 nothing else. The industry type shown above is **retrieved from OpenStreetMap, not predicted** — it
@@ -254,17 +312,28 @@ The same feature vector feeds the v1 rules and the planned v2 model.
 
 | Feature | Source | Rationale |
 |---|---|---|
-| `frp` | FIRMS | Fire Radiative Power (MW) — energy release rate |
-| `brightness_k` | FIRMS | Brightness temperature (K), VIIRS I-4 channel |
-| `confidence` | FIRMS | Detection reliability — VIIRS reports low / nominal / high |
-| `is_night` | FIRMS | Day/night flag; industrial heat is time-invariant, most crop burning is not |
-| `recurrence_90d` | Derived | Distinct days with a detection at this site in 90 days — the key discriminator |
-| `frp_mean`, `frp_cv` | Derived | Stability of radiative power; flares are stable, fires are not |
-| `first_seen`, `last_seen` | Derived | Site age — a source active for years is not an accident |
+| `frp_mean`, `frp_max` | FIRMS | Fire Radiative Power (MW) — energy release rate |
+| `frp_cv` | Derived | Stability of radiative power across the site's detections |
+| `brightness_max` | FIRMS | Peak brightness temperature (K), VIIRS I-4 channel |
+| `confidence` | FIRMS | Best detection reliability seen — VIIRS reports low / nominal / high |
+| `night_fraction` | FIRMS | Share of detections at night; industrial heat is time-invariant, most crop burning is not |
+| `detection_count` | Derived | Total observations at this location |
+| `recurrence_days` | Derived | Distinct days with a detection inside the window — the classic discriminator |
+| `site_age_days` | Derived | First to last detection; a source active for years is not an accident |
 | `dist_industrial_m` | OSM | Distance to nearest industrial feature — **a feature, not a label** |
 | `industrial_group` | OSM | Coarse category of the nearest feature (see below) |
-| `landcover_class` | ESA WorldCover | 10 m land cover beneath the detection |
-| `landcover_frac_builtup` | ESA WorldCover | Built-up fraction within a 500 m buffer |
+| `land_context` | ESA WorldCover | 10 m land cover beneath the detection, OSM land-use as fallback |
+| `event_count` | Derived | Number of distinct burning episodes |
+| `max_event_duration` | Derived | Longest continuous episode, in days — see below |
+| `longest_episode_density` | Derived | Detection days ÷ span of that episode; separates a sustained burn from scattered blips |
+| `mean_gap_days` | Derived | Average quiet interval between episodes |
+| `has_ongoing_event` | Derived | An episode here is not yet closed by a quiet gap — the field an alert query filters on |
+
+**Why the episode features earn their place, and why `event_count` alone does not.** Measured across
+all 556 sites in the current build, `event_count` averages 2.83 for confirmed persistent sources
+against 1.07 for vegetation fires — heavily overlapping, and the Hazira steel plant scores the same
+3 as a site with four stray detections. `max_event_duration` averages **48.2 days against 1.9**, with
+a median of 49 against 1. Arrangement is informative; the count of episodes is not, on its own.
 
 **Industrial groups.** OpenStreetMap carries dozens of industrial tags. With a few hundred training
 examples, a high-cardinality categorical fragments into splits too thin to learn from, so tags are
@@ -316,8 +385,9 @@ configuration choice rather than an architectural commitment.
 
 | Layer | Purpose | Notes |
 |---|---|---|
-| OpenStreetMap standard | Default base map, street and industrial context | Free, no key |
-| Esri World Imagery | Satellite view — see the actual facility beneath a hotspot | Free, attribution required |
+| Esri World Street Map | Default base map, street and industrial context | Free, no key, attribution required |
+| Esri World Light Gray | Muted base map that lets classified hotspots dominate | Free, no key |
+| Esri World Imagery | Satellite view — see the actual facility beneath a hotspot | Free, no key, attribution required |
 | ISRO Bhuvan (planned) | Indian geospatial reference layers via WMS | Adds an Indian authoritative source |
 | Industrial infrastructure | OSM industrial features as an overlay | Derived from our own cached extract |
 | Classified hotspots | Colour-coded by class, with clustering at low zoom | The primary layer |
@@ -353,6 +423,16 @@ our district geometries match the sets used in Indian government and census repo
 BharatViz's hosted web application additionally exports publication-quality SVG and PNG choropleths
 from a CSV, which is useful for producing static figures for reports without writing plotting code.
 
+**A note on basemap providers, since two obvious choices do not work.**
+`openstreetmap.org`'s own tile servers are volunteer-funded and explicitly *not* an
+application CDN — their usage policy deprecates the `{s}` subdomains and the servers
+returned HTTP 403 "Access blocked" tiles in testing. CARTO served tiles successfully but
+stamped "API KEY REQUIRED" across every one of them. Esri's ArcGIS Online services serve
+street, light and satellite basemaps without a key or registration, requiring only
+attribution, so all three basemaps are sourced from there. OpenStreetMap remains the source
+of our *industrial infrastructure data* via Overpass — that is a separate service with
+different, and far lighter, load characteristics.
+
 We are not adopting a single-vendor map SDK. Commercial Indian map APIs can be consumed through
 their raster tile endpoints as an additional Leaflet layer if required, but binding the application
 to a keyed, quota-limited external service would introduce a live failure mode during operation for
@@ -383,16 +463,18 @@ no analytical gain.
 |---|---|---|
 | FIRMS VIIRS ingestion | ✅ | Open regional feeds (7-day) and keyed API (90-day), deduplicated |
 | Spatial clustering into persistent sites | ✅ | 0.005° grid; enables recurrence features |
+| Episode segmentation into burning events | ✅ | Gap-bounded runs; 663 episodes across 556 sites |
 | OSM industrial layer and distance features | ✅ | 3,595 features cached for Gujarat |
 | ESA WorldCover land cover lookup | ✅ | 10 m, read remotely from Cloud Optimized GeoTIFFs |
 | Rule-based classifier (v1) | ✅ | Window-relative thresholds, documented above |
 | Interactive Leaflet map with layers and filters | ✅ | Class, FRP, recurrence, confidence |
-| Per-site evidence panel | ✅ | Shows the features behind each label |
+| Per-site evidence panel | ✅ | Shows the features behind each label, plus an episode strip |
 | Plotly analytics dashboard | ✅ | Class distribution, detections/day, recurrence spread |
 | District choropleth layer | 📋 | BharatViz boundaries + aggregated counts |
 | Historical playback over time | 📋 | |
 | Manual annotation interface | 📋 | Pre-labelled by v1 rules, corrected by reviewers |
 | Labelled training dataset (target: 300–500 verified sites) | 📋 | Corridor-scoped; quality and class balance over volume |
+| Event-level classification | 📋 | Labels currently sit on `Site`; moving them to `Event` lets two fires months apart be judged separately |
 | Random Forest classifier (v2) | 📋 | Replaces v1 rules behind the same interface |
 | Model evaluation on a held-out test set | 📋 | No accuracy will be claimed before this exists |
 | MODIS fusion | 📋 | Multi-sensor detection merging |
@@ -409,7 +491,8 @@ no analytical gain.
 flowchart LR
     subgraph Ingest["Ingestion (management commands)"]
         A1[FIRMS VIIRS fetch] --> A2[Clustering]
-        A2 --> A3[OSM + land cover enrichment]
+        A2 --> A2b[Episode segmentation]
+        A2b --> A3[OSM + land cover enrichment]
     end
     A3 --> DB[(SQLite)]
     DB --> D["Django views<br/>+ rule classifier"]
@@ -464,11 +547,7 @@ pip install -r requirements.txt
 
 ### Configuration
 
-```bash
-cp .env.example .env
-```
-
-Then edit `.env`:
+Create a `.env` file in the project root:
 
 ```
 FIRMS_MAP_KEY=your_key_here
@@ -478,7 +557,12 @@ INGEST_BBOX=68.9,20.0,73.5,23.6
 VALIDATION_BBOX=72.4,21.0,73.2,22.0
 ```
 
-**Never commit `.env`.** It is listed in `.gitignore`.
+Every value has a working default except `FIRMS_MAP_KEY`, and the pipeline falls back to NASA's open
+7-day feeds without one — so the file is optional for a first run, and the block above is the whole
+template.
+
+**Never commit `.env`.** `.gitignore` excludes it, and the repository ships no example file to copy,
+so there is no path by which a real key reaches version control.
 
 ### Running
 
@@ -496,20 +580,24 @@ Open http://127.0.0.1:8000.
 ```
 agnidrishti/
 ├── core/                  # Django project settings, URLs
-├── hotspots/              # Detections, sites, ingestion, management commands
-│   ├── models.py
+├── hotspots/              # Detections, sites, events, ingestion
+│   ├── models.py          # Detection, Site, Event
 │   ├── services/
-│   │   ├── firms.py       # FIRMS API client
-│   │   ├── clustering.py  # Detections -> persistent sites
-│   │   └── enrichment.py  # OSM distance + land cover sampling
+│   │   ├── firms.py       # FIRMS API client (keyed 90-day, open 7-day, local CSV)
+│   │   ├── clustering.py  # Detections -> sites; sites -> episodes
+│   │   ├── geo.py         # Haversine, grid keys, coefficient of variation
+│   │   ├── osm.py         # Overpass client; industrial + land-use layers
+│   │   ├── landcover.py   # ESA WorldCover 10 m, read from remote COGs
+│   │   └── enrichment.py  # R-tree lookups: nearest industry, land context
 │   └── management/commands/
+│       ├── load_context_layers.py
+│       └── ingest_firms.py
 ├── classification/        # Classifier interface, v1 rules, (v2 model)
-│   ├── base.py            # Classifier protocol
+│   ├── base.py            # Classifier protocol + SiteFeatures vector
 │   ├── rules.py           # v1 transparent rule set
 │   └── features.py        # Feature extraction
 ├── dashboard/             # Map, filters, analytics views and templates
-├── data/                  # Cached context layers (gitignored)
-└── notebooks/             # Exploratory analysis
+└── data/                  # Cached context layers (gitignored)
 ```
 
 ## Roadmap
@@ -543,7 +631,7 @@ annual cycle, and Sentinel-1 SAR as an additional evidence layer.
 | Transport | HTTPS/TLS in any deployed environment |
 | Authentication | Django's authentication framework; Argon2id password hashing |
 | Authorisation | Role-based access control — admin, operator, viewer |
-| Secrets | Environment variables; never committed. `.env` is gitignored and `.env.example` holds only placeholder values |
+| Secrets | Environment variables; never committed. `.env` is gitignored, and the repository ships no example file, so configuration is documented in the README rather than kept as a copyable file that can drift into holding a real key |
 | Input handling | Django form and serializer validation; ORM-parameterised queries |
 | Auditing | Audit log for administrative and configuration actions |
 | Data at rest | Encryption where the deployment environment supports it; regular backups |
@@ -563,6 +651,12 @@ limits are hidden.
   day. A fire that starts and is extinguished between overpasses is never seen. **This is not a
   real-time fire detection system.**
 - **Cloud cover and dense smoke suppress detections,** which matters most during the monsoon.
+- **Episode boundaries are a chosen threshold, not a measurement.** FIRMS reports detections, not
+  clear-sky observations, so the pipeline cannot distinguish *"this location stopped burning"* from
+  *"we could not see it"*. A 10-day gap threshold is a judgement about how long a silence must last
+  before it means something. Set it too tight and monsoon cloud shatters one continuous furnace into
+  phantom incidents; set it too loose and genuinely separate fires merge. Episode counts should be
+  read with that in mind, and the threshold revisited once a dry-season window is available.
 - **Small or low-temperature fires fall below the detection threshold** and are invisible to the
   entire pipeline.
 - **Validation is corridor-scoped.** The system runs statewide, but our labelled data comes from a
@@ -578,8 +672,16 @@ limits are hidden.
   very few samples. Continuous industrial processes such as steel furnaces can therefore be scored as
   fires rather than persistent sources. The 90-day archive resolves this, and it is the single
   highest-value upgrade to the current prototype.
+- **Classification is still site-level, not episode-level.** Episodes are modelled and stored, and
+  their statistics feed the rules, but a location receives one label covering its whole history. Two
+  fires months apart are therefore visible as separate rows and separate bars in the evidence panel,
+  yet still share a single classification. Moving the label onto `Event` is the next step and is what
+  would make *"a new fire has started at a known location"* something the system can announce rather
+  than merely record.
 - **No accuracy is claimed for v1.** The rule thresholds are informed estimates awaiting validation
   against a labelled test set. Any performance figures will be published only once that set exists.
+  This now includes the episode density floor of 0.25, which is calibrated against six confirmed
+  persistent sources — far too few to call it validated.
 - **This is a screening and prioritisation layer,** intended to help authorities direct attention. It
   does not replace ground sensors, plant safety systems, or fire services.
 

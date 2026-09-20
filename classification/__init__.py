@@ -1,6 +1,12 @@
-from .base import Classification, Classifier, SiteFeatures
-from .rules import RuleClassifier
+from .base import Classification, Classifier, EventFeatures
+from .rules import EventRuleClassifier
 
-default_classifier: Classifier = RuleClassifier()
+default_classifier: Classifier = EventRuleClassifier()
 
-__all__ = ["Classification", "Classifier", "SiteFeatures", "RuleClassifier", "default_classifier"]
+__all__ = [
+    "Classification",
+    "Classifier",
+    "EventFeatures",
+    "EventRuleClassifier",
+    "default_classifier",
+]

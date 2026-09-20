@@ -124,9 +124,17 @@
 
 <script>
 // Alpine component for the filter sidebar.
+// Initial filter state is read from the query string, so a particular view of the
+// map can be linked to directly -- useful for walking through a specific cluster
+// during a demo instead of hunting for it live.
+//   ?label=industrial_fire&label=persistent_source&lat=21.12&lon=72.65&zoom=12
 function dashboard() {
+  const q = new URLSearchParams(location.search);
   return {
-    labels: [], minFrp: 0, minRec: 0, conf: [],
+    labels: q.getAll('label'),
+    minFrp: +(q.get('min_frp') || 0),
+    minRec: +(q.get('min_recurrence') || 0),
+    conf: q.getAll('confidence'),
     params() {
       const p = new URLSearchParams();
       this.labels.forEach(l => p.append('label', l));
@@ -156,7 +164,15 @@ function dashboard() {
   };
   const CONFIG = { displayModeBar: false, responsive: true };
 
+  const params = new URLSearchParams(location.search);
+  const hasExplicitView = params.has('lat') && params.has('lon');
+
   function fitToData() {
+    // An explicit ?lat/?lon/?zoom wins: the caller has asked for a specific view.
+    if (hasExplicitView) {
+      map.setView([+params.get('lat'), +params.get('lon')], +(params.get('zoom') || 12));
+      return;
+    }
     // Frame the data itself: ingestion is statewide, so fitting the validation
     // corridor alone would hide most of what the system classified.
     if (siteLayer && siteLayer.getLayers().length) {
@@ -241,18 +257,45 @@ function dashboard() {
     const centre = [(bounds[0][0] + bounds[1][0]) / 2, (bounds[0][1] + bounds[1][1]) / 2];
     map = L.map('map', { zoomControl: true }).setView(centre, 9);
 
-    const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-      attribution: '&copy; OpenStreetMap contributors', maxZoom: 19
-    }).addTo(map);
+    // All basemaps come from Esri's ArcGIS Online tile services.
+    //
+    // Two providers were tried first and both failed for reasons worth recording.
+    // openstreetmap.org's own tiles are volunteer-funded and explicitly not an
+    // application CDN: their usage policy deprecates the {s} subdomains and the
+    // servers returned HTTP 403 "Access blocked" tiles. CARTO then served tiles
+    // successfully but stamped "API KEY REQUIRED" across every one of them.
+    //
+    // Esri serves these layers without a key or registration, and needs only
+    // attribution. Note the {z}/{y}/{x} order, which is reversed relative to OSM.
+    const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services';
+    const ESRI_ATTR =
+      'Tiles &copy; Esri &mdash; Esri, HERE, Garmin, USGS, NGA, ' +
+      '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
-    // Esri World Imagery uses {z}/{y}/{x} -- reversed relative to OSM.
+    const streetLayer = L.tileLayer(
+      ESRI + '/World_Street_Map/MapServer/tile/{z}/{y}/{x}',
+      { attribution: ESRI_ATTR, maxZoom: 19 }
+    ).addTo(map);
+
+    const lightLayer = L.tileLayer(
+      ESRI + '/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+      { attribution: ESRI_ATTR, maxZoom: 16 }
+    );
+
     const satLayer = L.tileLayer(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      ESRI + '/World_Imagery/MapServer/tile/{z}/{y}/{x}',
       { attribution: 'Tiles &copy; Esri &mdash; Esri, Maxar, Earthstar Geographics', maxZoom: 19 }
     );
 
-    L.control.layers({ 'OpenStreetMap': osmLayer, 'Satellite imagery': satLayer }, {},
-                     { position: 'topright', collapsed: false }).addTo(map);
+    L.control.layers(
+      { 'Street map': streetLayer, 'Light': lightLayer, 'Satellite imagery': satLayer },
+      {}, { position: 'topright', collapsed: false }
+    ).addTo(map);
+
+    if (params.get('basemap') === 'satellite') {
+      map.removeLayer(streetLayer);
+      satLayer.addTo(map);
+    }
 
     L.rectangle(bounds, {
       color: '#334155', weight: 1.5, dashArray: '6 4', fill: false, interactive: false
@@ -261,8 +304,12 @@ function dashboard() {
     // Keep Leaflet in step if the pane is resized later.
     new ResizeObserver(() => map.invalidateSize()).observe(mapEl);
 
-    window.loadSites('');
-    window.loadCharts('');
+    const initial = new URLSearchParams();
+    for (const [k, v] of params) {
+      if (['label', 'confidence', 'min_frp', 'min_recurrence'].includes(k)) initial.append(k, v);
+    }
+    window.loadSites(initial.toString());
+    window.loadCharts(initial.toString());
   }
 
   init();

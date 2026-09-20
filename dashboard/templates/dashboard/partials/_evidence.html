@@ -1,4 +1,4 @@
-{% load static %}
+{% load static l10n %}
 <div class="p-4 space-y-4">
 
   <div>
@@ -85,6 +85,73 @@
       classes; facility type is supporting context.
     </p>
   </div>
+
+  {% if episodes %}
+  <div>
+    <p class="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+      Burning episodes &mdash; each classified on its own
+      <span class="block font-normal normal-case tracking-normal text-slate-400">
+        {{ site.event_count }} in {{ window_days }} days, longest {{ site.max_event_duration }}d.
+        The label above summarises the most significant.
+      </span>
+    </p>
+
+    {% comment %}
+      Each bar is one continuous episode, placed on the observed window. Opacity
+      tracks density, so a sparse run looks faint -- which is how much it should
+      be trusted. Localisation is switched off because these numbers go straight
+      into CSS, where a decimal comma would silently break the layout.
+      ({# #} is single-line only in Django; multi-line needs this tag.)
+    {% endcomment %}
+    {% localize off %}
+    <div class="relative h-5 overflow-hidden rounded bg-slate-100">
+      {% for ep in episodes %}
+        <div class="absolute inset-y-0.5 rounded-sm"
+             style="left:{{ ep.left|floatformat:2 }}%; width:{{ ep.width|floatformat:2 }}%; background:{{ ep.event.colour }}; opacity:{{ ep.opacity|floatformat:2 }}"
+             title="{{ ep.event.get_label_display }} &middot; {{ ep.event.start_date }} to {{ ep.event.end_date }}"></div>
+      {% endfor %}
+    </div>
+    {% endlocalize %}
+
+    <div class="mt-0.5 flex justify-between font-mono text-[10px] text-slate-400">
+      <span>{{ window_start|date:"d M" }}</span>
+      <span>{{ window_end|date:"d M" }}</span>
+    </div>
+
+    <ul class="mt-2">
+      {% for ep in episodes %}
+        {% if ep.event.gap_before_days %}
+          {% comment %}
+            The quiet interval reads as a separator: it lands in time order and
+            stays off the episode's own line. The panel is only 320px wide and
+            the row wrapped mid-phrase when the gap sat inline.
+          {% endcomment %}
+          <li class="flex items-center gap-2 py-1 text-[10px] text-slate-400">
+            <span class="h-px flex-1 bg-slate-200"></span>
+            <span class="shrink-0">{{ ep.event.gap_before_days }} days quiet</span>
+            <span class="h-px flex-1 bg-slate-200"></span>
+          </li>
+        {% endif %}
+        <li class="flex items-baseline gap-2 text-[12px] leading-snug">
+          <span class="shrink-0 font-mono text-slate-500">
+            {{ ep.event.start_date|date:"d M" }}&ndash;{{ ep.event.end_date|date:"d M" }}
+          </span>
+          <span class="text-slate-700">
+            {{ ep.event.duration_days }}d &middot; {{ ep.event.active_days }}d active
+          </span>
+          {% if ep.event.is_ongoing %}
+            <span class="shrink-0 rounded bg-amber-100 px-1 text-[10px] font-medium text-amber-700">open</span>
+          {% endif %}
+        </li>
+        <li class="mb-1 flex items-center gap-1.5 pl-1 text-[11px]">
+          <span class="h-2 w-2 shrink-0 rounded-full" style="background: {{ ep.event.colour }}"></span>
+          <span style="color: {{ ep.event.colour }}">{{ ep.event.get_label_display }}</span>
+          <span class="text-slate-400">&middot; {{ ep.event.label_confidence }} confidence</span>
+        </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
 
   <div>
     <p class="mb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-500">

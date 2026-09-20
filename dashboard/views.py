@@ -109,7 +109,7 @@ def site_detail(request, pk: int):
     Every classification is shown together with the features that produced it --
     a user should never see a bare label.
     """
-    site = get_object_or_404(Site.objects.prefetch_related("detections"), pk=pk)
+    site = get_object_or_404(Site.objects.prefetch_related("detections", "events"), pk=pk)
     detections = list(site.detections.all()[:400])
 
     # Recurrence is only interpretable against the period actually observed, so the
@@ -118,6 +118,25 @@ def site_detail(request, pk: int):
     window_days = (
         (span["hi"] - span["lo"]).days + 1 if span["lo"] and span["hi"] else 0
     )
+
+    # Episode strip: each burning episode placed on the observed window, so the
+    # shape of a location's history is readable at a glance. One 73-day run and
+    # five scattered single days produce very different pictures and are the whole
+    # reason episodes are modelled separately from sites.
+    episodes = []
+    for event in site.events.all():
+        offset = (event.start_date - span["lo"]).days if span["lo"] else 0
+        episodes.append(
+            {
+                "event": event,
+                "left": 100 * offset / window_days if window_days else 0,
+                # A single-day episode would otherwise be invisible.
+                "width": max(1.2, 100 * event.duration_days / window_days) if window_days else 0,
+                # Denser episodes read as more solid; a sparse run looks faint,
+                # which is exactly how much it should be trusted.
+                "opacity": round(0.30 + 0.70 * event.density, 2),
+            }
+        )
 
     timeline = defaultdict(float)
     for detection in detections:
@@ -134,6 +153,9 @@ def site_detail(request, pk: int):
             "timeline_dates": sorted(timeline),
             "timeline_frp": [round(timeline[d], 1) for d in sorted(timeline)],
             "window_days": window_days,
+            "episodes": episodes,
+            "window_start": span["lo"],
+            "window_end": span["hi"],
         },
     )
 

@@ -18,8 +18,8 @@ from django.db.models import Max, Min
 from django.utils import timezone
 
 from classification.features import extract
-from classification.rules import RuleClassifier
-from hotspots.models import Detection, Site
+from classification.rules import EventRuleClassifier
+from hotspots.models import Detection, Event, Site
 from hotspots.services import clustering, firms, osm
 from hotspots.services.enrichment import ContextEnricher
 from hotspots.services.landcover import WorldCoverProvider
@@ -31,7 +31,10 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--days", type=int, default=90, help="Days of history (default 90).")
-        parser.add_argument("--source", default=firms.DEFAULT_SOURCE, help="FIRMS product.")
+        parser.add_argument(
+            "--source", default=firms.DEFAULT_SOURCE,
+            help="FIRMS product for the public-feed path (keyed path auto-selects NRT/archive).",
+        )
         parser.add_argument("--bbox", choices=["validation", "ingest"], default="validation")
         parser.add_argument("--csv", help="Load from a local FIRMS CSV instead of the API.")
         parser.add_argument(
@@ -102,7 +105,6 @@ class Command(BaseCommand):
                     map_key=settings.FIRMS_MAP_KEY,
                     bbox=bbox,
                     days=options["days"],
-                    source=options["source"],
                 ),
                 options["days"],
             )
@@ -186,11 +188,15 @@ class Command(BaseCommand):
                 )
                 window_days = observed
 
-        classifier = RuleClassifier(window_days=window_days)
+        # The most recent day any detection exists for. An episode ending close to
+        # this date has not yet been closed by a quiet gap, so it may still be
+        # burning; one ending long before it is definitively over.
+        latest_date = span["hi"]
+
+        classifier = EventRuleClassifier(window_days=window_days)
         self.stdout.write(
-            f"Classifier window: {window_days} days "
-            f"(persistent >= {classifier.persistent_min} days, "
-            f"episodic <= {classifier.episodic_max} days)"
+            f"Classifier window: {window_days} days - episodes are sustained at "
+            f">= {classifier.sustained_min} days and brief at <= {classifier.brief_max}"
         )
 
         sites = list(Site.objects.prefetch_related("detections").all())
@@ -200,7 +206,7 @@ class Command(BaseCommand):
         # Land cover is sampled for every site in one batch, because WorldCover
         # groups points by raster tile and opens each tile once. Doing it per site
         # would reopen the same remote raster hundreds of times.
-        land_cover: list[str] = ["unknown"] * total
+        land_cover: list[tuple[str, float]] = [("unknown", 0.0)] * total
         if use_worldcover and total:
             self.stdout.write("Sampling ESA WorldCover (10 m)...")
             try:
@@ -213,10 +219,15 @@ class Command(BaseCommand):
                 )
 
         counts: dict[str, int] = {}
+        event_counts: dict[str, int] = {}
         land_sources = {"worldcover": 0, "osm": 0, "none": 0}
         updated = []
+        all_events: list[Event] = []
         for index, site in enumerate(sites, start=1):
             clustering.rebuild_site_features(site)
+            # Episodes are cut here but classified further down: an episode cannot
+            # be judged before we know what is under it and what is near it.
+            events = clustering.rebuild_site_events(site, latest_date=latest_date)
 
             match = enricher.nearest_industrial(site.latitude, site.longitude)
             site.dist_industrial_m = match.distance_m
@@ -224,25 +235,36 @@ class Command(BaseCommand):
             site.industrial_name = match.name[:200]
             # WorldCover is wall-to-wall, so it answers for almost every site.
             # OSM land-use remains the fallback for the rare gap.
-            context = land_cover[index - 1]
+            context, built_fraction = land_cover[index - 1]
             if context != "unknown":
                 land_sources["worldcover"] += 1
             else:
+                # The OSM land-use fallback is polygon-based and cannot report a
+                # footprint fraction, so the rules fall back to the class alone.
                 context = enricher.land_context(site.latitude, site.longitude)
+                built_fraction = 0.0
                 land_sources["osm" if context != "unknown" else "none"] += 1
             site.land_context = context
+            site.landcover_frac_builtup = built_fraction
             site.in_validation_corridor = in_bbox(
                 site.latitude, site.longitude, settings.VALIDATION_BBOX
             )
 
-            result = classifier.predict(extract(site))
-            site.label = result.label
-            site.label_confidence = result.confidence
-            site.evidence = result.evidence
-            site.matched_rule = result.matched_rule
+            # Now that the site carries its context, judge each episode on its
+            # own, then summarise the location from what they say.
+            for event in events:
+                result = classifier.predict(extract(event, site))
+                event.label = result.label
+                event.label_confidence = result.confidence
+                event.evidence = result.evidence
+                event.matched_rule = result.matched_rule
+                event_counts[result.label] = event_counts.get(result.label, 0) + 1
+
+            clustering.summarise_site_from_events(site, events)
             site.enriched_at = timezone.now()
 
-            counts[result.label] = counts.get(result.label, 0) + 1
+            counts[site.label] = counts.get(site.label, 0) + 1
+            all_events.extend(events)
             updated.append(site)
 
             if index % 500 == 0:
@@ -254,17 +276,40 @@ class Command(BaseCommand):
                 "latitude", "longitude", "first_seen", "last_seen", "detection_count",
                 "recurrence_days", "night_fraction", "frp_mean", "frp_max", "frp_cv",
                 "brightness_max", "best_confidence", "dist_industrial_m", "industrial_group",
-                "industrial_name", "land_context", "label", "label_confidence", "evidence",
+                "industrial_name", "land_context", "landcover_frac_builtup",
+                "label", "label_confidence", "evidence",
                 "matched_rule", "in_validation_corridor", "enriched_at",
+                "event_count", "max_event_duration", "longest_episode_active_days",
+                "mean_gap_days", "has_ongoing_event",
             ],
             batch_size=500,
         )
 
+        # Episodes are rebuilt wholesale rather than appended to. Detections can
+        # arrive late and close a gap that previously split one burn in two, so
+        # incremental updates would leave stale boundaries behind.
+        Event.objects.all().delete()
+        Event.objects.bulk_create(all_events, batch_size=1000)
+
+        ongoing = sum(1 for s in updated if s.has_ongoing_event)
+        multi = sum(1 for s in updated if s.event_count > 1)
+        longest = max((s.max_event_duration for s in updated), default=0)
+        self.stdout.write(
+            f"Episodes: {len(all_events)} across {total} sites "
+            f"({multi} sites with more than one, {ongoing} with an open episode, "
+            f"longest run {longest} days)."
+        )
         self.stdout.write(
             f"Land cover source: {land_sources['worldcover']} WorldCover, "
             f"{land_sources['osm']} OSM fallback, {land_sources['none']} unresolved."
         )
-        self.stdout.write(self.style.SUCCESS("Classification complete:"))
+        n_events = len(all_events)
+        self.stdout.write(self.style.SUCCESS(f"Episodes classified ({n_events}):"))
+        for label, count in sorted(event_counts.items(), key=lambda kv: -kv[1]):
+            share = 100 * count / n_events if n_events else 0
+            self.stdout.write(f"  {label:20s} {count:6d}  ({share:5.1f}%)")
+
+        self.stdout.write(self.style.SUCCESS(f"Site summary labels ({total}):"))
         for label, count in sorted(counts.items(), key=lambda kv: -kv[1]):
             share = 100 * count / total if total else 0
             self.stdout.write(f"  {label:20s} {count:6d}  ({share:5.1f}%)")

@@ -109,3 +109,14 @@ SITE_GRID_DEG = 0.005
 
 # Rolling window used for recurrence statistics.
 RECURRENCE_WINDOW_DAYS = 90
+
+# A site's detection history is cut into separate events wherever it falls quiet
+# for longer than this many days.
+#
+# The threshold is deliberately generous. FIRMS cannot see through cloud, so a
+# continuously-operating furnace goes dark for days at a time during the monsoon --
+# and Gujarat's monsoon covers most of our observation window. At a 7-day
+# threshold the Hazira steel plant already fragments into three events; anything
+# tighter would shatter every persistent source in the state into dozens of
+# phantom "incidents". A quiet gap is evidence of absence only when it is long.
+EVENT_GAP_DAYS = 10

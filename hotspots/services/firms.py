@@ -29,8 +29,15 @@ PUBLIC_FEEDS = {
     "VIIRS_NOAA21": f"{PUBLIC_BASE}/noaa-21-viirs-c2/csv/J2_VIIRS_C2_{{region}}_{{span}}.csv",
 }
 HEADERS = {"User-Agent": "AgniDrishti/0.1 (SIH prototype; thermal anomaly classification)"}
-MAX_DAYS_PER_REQUEST = 10
+# FIRMS rejects anything above 5 with "Invalid day range. Expects [1..5]".
+MAX_DAYS_PER_REQUEST = 5
 REQUEST_TIMEOUT = 120
+
+# Near-real-time products only retain roughly the last three months; anything
+# older lives in the separate standard-processing (_SP) archive. The cutoff moves
+# forward over time, so it is queried rather than hardcoded.
+AVAILABILITY_URL = "https://firms.modaps.eosdis.nasa.gov/api/data_availability/csv"
+VIIRS_FAMILIES = ("VIIRS_SNPP", "VIIRS_NOAA20", "VIIRS_NOAA21")
 
 # VIIRS is the default: 375 m pixels against MODIS's 1 km, and more detections.
 DEFAULT_SOURCE = "VIIRS_SNPP_NRT"
@@ -38,6 +45,45 @@ DEFAULT_SOURCE = "VIIRS_SNPP_NRT"
 
 class FirmsError(RuntimeError):
     """Raised when FIRMS returns something that is not usable CSV."""
+
+
+def _redact(text: str, map_key: str) -> str:
+    """Strip the API key out of anything headed for a log.
+
+    The key travels in the URL path, so unredacted request errors would write it
+    straight into log files.
+    """
+    return text.replace(map_key, "<MAP_KEY>") if map_key else text
+
+
+def availability(map_key: str) -> dict[str, tuple[date, date]]:
+    """Date range each FIRMS product currently serves, keyed by product name."""
+    try:
+        response = requests.get(f"{AVAILABILITY_URL}/{map_key}/all", timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Could not read FIRMS availability: %s", _redact(str(exc), map_key))
+        return {}
+
+    ranges: dict[str, tuple[date, date]] = {}
+    for row in csv.DictReader(io.StringIO(response.text)):
+        try:
+            ranges[row["data_id"]] = (
+                date.fromisoformat(row["min_date"]), date.fromisoformat(row["max_date"])
+            )
+        except (KeyError, ValueError):
+            continue
+    return ranges
+
+
+def _product_for(family: str, start: date, end: date, ranges: dict) -> str | None:
+    """Pick the NRT or archive product whose coverage contains this window."""
+    for suffix in ("_NRT", "_SP"):
+        name = family + suffix
+        covered = ranges.get(name)
+        if covered and covered[0] <= start and end <= covered[1]:
+            return name
+    return None
 
 
 @dataclass
@@ -102,13 +148,17 @@ def fetch(
     map_key: str,
     bbox: tuple[float, float, float, float],
     days: int = 90,
-    source: str = DEFAULT_SOURCE,
+    families: tuple[str, ...] = VIIRS_FAMILIES,
     end: date | None = None,
 ) -> list[FirmsRecord]:
-    """Fetch detections for a bounding box, chunked to respect the 10-day limit.
+    """Fetch detections for a bounding box across the full requested history.
 
-    ``bbox`` is (lon_min, lat_min, lon_max, lat_max), matching the order FIRMS
-    expects (west, south, east, north).
+    All three VIIRS platforms are pulled and merged, and each 5-day window is
+    routed to whichever product actually covers those dates -- near-real-time for
+    recent weeks, the standard-processing archive for anything older.
+
+    ``bbox`` is (lon_min, lat_min, lon_max, lat_max), matching the west, south,
+    east, north order FIRMS expects.
     """
     if not map_key:
         raise FirmsError(
@@ -119,28 +169,33 @@ def fetch(
     area = ",".join(str(round(v, 4)) for v in bbox)
     end = end or date.today()
     start = end - timedelta(days=days)
+    ranges = availability(map_key)
 
     records: list[FirmsRecord] = []
-    cursor = start
-    while cursor < end:
-        span = min(MAX_DAYS_PER_REQUEST, (end - cursor).days)
-        url = f"{BASE_URL}/{map_key}/{source}/{area}/{span}/{cursor.isoformat()}"
-        logger.info("FIRMS request: %s %s +%sd", source, cursor, span)
-        try:
-            response = requests.get(url, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            chunk = parse_csv(response.text)
-        except FirmsError as exc:
-            # One bad window should not abort a 90-day backfill: near-real-time
-            # products simply have no data beyond their retention period.
-            logger.warning("Skipping window starting %s: %s", cursor, exc)
-            chunk = []
-        except requests.RequestException as exc:
-            logger.warning("Network error for window starting %s: %s", cursor, exc)
-            chunk = []
-        records.extend(chunk)
-        cursor += timedelta(days=span)
+    skipped: set[str] = set()
+    for family in families:
+        cursor = start
+        while cursor < end:
+            span = min(MAX_DAYS_PER_REQUEST, (end - cursor).days)
+            window_end = cursor + timedelta(days=span)
+            product = _product_for(family, cursor, window_end, ranges)
+            if product is None:
+                skipped.add(f"{family} {cursor}")
+                cursor = window_end
+                continue
 
+            url = f"{BASE_URL}/{map_key}/{product}/{area}/{span}/{cursor.isoformat()}"
+            try:
+                response = requests.get(url, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                records.extend(parse_csv(response.text))
+            except (requests.RequestException, FirmsError) as exc:
+                logger.warning("FIRMS %s %s: %s", product, cursor, _redact(str(exc), map_key))
+            cursor = window_end
+
+    if skipped:
+        logger.info("No product covered %d window(s); oldest data may be unavailable",
+                    len(skipped))
     return records
 
 
